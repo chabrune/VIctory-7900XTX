@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use victory_core::display::{self, Mode};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -8482,6 +8484,12 @@ struct Presenter {
     meter: Meter,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+    /// The flags the swap chain was made with; a resize keeps them.
+    flags: DXGI_SWAP_CHAIN_FLAG,
+    /// Whether presents may tear (no vertical sync, and the screen allows it).
+    tearing: bool,
+    /// When the last frame went to the screen, for the frame cap.
+    shown: Option<std::time::Instant>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -8828,7 +8836,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, p.flags)
             };
             match resized {
                 Ok(()) => {
@@ -8933,7 +8941,31 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // Vertical sync waits for the screen; without it a frame is
+            // shown as it is ready, and the cap (if any) holds the frame
+            // rate down for titles that draw faster than wanted.
+            let wanted = *display::settings();
+            let (interval, flags) = if wanted.vsync {
+                (1, DXGI_PRESENT(0))
+            } else if p.tearing {
+                (0, DXGI_PRESENT_ALLOW_TEARING)
+            } else {
+                (0, DXGI_PRESENT(0))
+            };
+            let _ = p.swap_chain.Present(interval, flags);
+            showing.next("the frame cap");
+            if let Some(period) = wanted.frame_period() {
+                let now = std::time::Instant::now();
+                let target = p.shown.map_or(now, |last| last + period);
+                if target > now {
+                    std::thread::sleep(target - now);
+                    p.shown = Some(target);
+                } else {
+                    p.shown = Some(now);
+                }
+            } else {
+                p.shown = Some(std::time::Instant::now());
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -8956,10 +8988,20 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        let wanted = *display::settings();
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            // Tearing (a frame shown the moment it is ready, no wait for the
+            // screen) needs the screen to allow it; without it the swap
+            // chain still presents immediately, as every measured run did.
+            let tearing = !wanted.vsync && tearing_allowed(&factory);
+            let flags = if tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            } else {
+                DXGI_SWAP_CHAIN_FLAG(0)
+            };
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -8971,14 +9013,37 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: flags.0 as u32,
                 ..Default::default()
             };
+            // Always a windowed swap chain. DXGI's exclusive fullscreen
+            // (a fullscreen description, `SetFullscreenState`, its own
+            // Alt+Enter) sends messages to the window and waits for them;
+            // the window is the title's, whose thread can be waiting on
+            // this one, and the first try hung here until the title's own
+            // watchdog ended the run. A flip-model swap chain on a window
+            // that covers the screen gets the direct ("independent flip")
+            // path on Windows 10 and 11 instead: no compositor in between,
+            // tearing and variable refresh allowed.
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            if let Err(e) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
+                tracing::warn!(error = %e, "DXGI's own Alt+Enter is still on");
+            }
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                mode = wanted.mode.as_str(),
+                screen = wanted.monitor,
+                vsync = wanted.vsync,
+                tearing,
+                frame_limit = wanted.frame_limit.unwrap_or(0),
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
@@ -8991,6 +9056,9 @@ impl Host {
                 meter: Meter::new(),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                flags,
+                tearing,
+                shown: None,
             })
         }
     }
@@ -9473,6 +9541,7 @@ extern "system" fn window_proc(
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
+    let display = *display::settings();
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -9485,28 +9554,121 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: width as i32,
-            bottom: height as i32,
+        let (x, y, wide, tall, style) = match display.mode {
+            Mode::Windowed => {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                };
+                AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+                let (wide, tall) = (rect.right - rect.left, rect.bottom - rect.top);
+                let (work, _) = screen(display.monitor);
+                (
+                    work.left + (work.right - work.left - wide) / 2,
+                    work.top + (work.bottom - work.top - tall) / 2,
+                    wide,
+                    tall,
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                )
+            }
+            Mode::Borderless | Mode::Fullscreen => {
+                let (_, whole) = screen(display.monitor);
+                (
+                    whole.left,
+                    whole.top,
+                    whole.right - whole.left,
+                    whole.bottom - whole.top,
+                    WS_POPUP | WS_VISIBLE,
+                )
+            }
         };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            style,
+            x,
+            y,
+            wide,
+            tall,
             None,
             None,
             Some(instance.into()),
             None,
         )
     }
+}
+
+/// Whether the screen allows a present to tear (asked once per swap chain).
+fn tearing_allowed(factory: &IDXGIFactory2) -> bool {
+    let Ok(factory5) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut allowed = 0u32;
+    // SAFETY: the query writes one u32 into our room for it.
+    let asked = unsafe {
+        factory5.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allowed).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
+    asked.is_ok() && allowed != 0
+}
+
+/// The work area and the whole bounds of screen `index` (the system's own
+/// order, 0 first), in the virtual screen's coordinates. The main screen's
+/// when the system lists no such screen.
+fn screen(index: usize) -> (RECT, RECT) {
+    struct Found {
+        wanted: usize,
+        seen: usize,
+        work: RECT,
+        whole: RECT,
+    }
+    unsafe extern "system" fn visit(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> windows::core::BOOL {
+        // SAFETY: `data` is the `Found` the enumeration was given.
+        let found = unsafe { &mut *(data.0 as *mut Found) };
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a monitor the system just named; `info` is ours.
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() && found.seen == found.wanted {
+            found.work = info.rcWork;
+            found.whole = info.rcMonitor;
+        }
+        found.seen += 1;
+        true.into()
+    }
+    let mut found = Found {
+        wanted: index,
+        seen: 0,
+        work: RECT::default(),
+        whole: RECT::default(),
+    };
+    // SAFETY: the callback only writes `found`, which outlives the call.
+    let listed = unsafe {
+        EnumDisplayMonitors(None, None, Some(visit), LPARAM(&raw mut found as isize)).as_bool()
+    };
+    if !listed || found.seen <= index {
+        let (wide, tall) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        let whole = RECT {
+            left: 0,
+            top: 0,
+            right: wide,
+            bottom: tall,
+        };
+        return (whole, whole);
+    }
+    (found.work, found.whole)
 }
 
 fn pump() {

@@ -53,6 +53,9 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Fix the PC settings before anything presents or polls a key.
+    victory_core::display::set(cfg.display);
+    victory_core::input::set(cfg.input.clone());
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -106,6 +109,15 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    println!(
+        "display        {} on screen {}, vsync {}, frame cap {}",
+        cfg.display.mode.as_str(),
+        cfg.display.monitor,
+        if cfg.display.vsync { "on" } else { "off" },
+        cfg.display
+            .frame_limit
+            .map_or_else(|| "none".to_owned(), |fps| format!("{fps} fps"))
+    );
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());

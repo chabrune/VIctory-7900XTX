@@ -1,8 +1,9 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! stand-in gamepad (the configuration's `[input]` table, see
+//! `victory.example.toml`). The keyboard is a device of its own too. A poll
+//! thread turns host state into readings (a new one per change) and runs
+//! device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -61,24 +62,32 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
-    (b'X', X),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
-];
+/// The keyboard's stand-in gamepad: the configuration's `[input]` table.
+fn bindings() -> &'static victory_core::input::Bindings {
+    victory_core::input::settings()
+}
+
+/// The pad button `action` is, if it is one.
+fn button_bit(action: victory_core::input::Action) -> Option<u32> {
+    use victory_core::input::Action;
+    Some(match action {
+        Action::Menu => MENU,
+        Action::View => VIEW,
+        Action::A => A,
+        Action::B => B,
+        Action::X => X,
+        Action::Y => Y,
+        Action::Up => UP,
+        Action::Down => DOWN,
+        Action::Left => LEFT,
+        Action::Right => RIGHT,
+        Action::LeftShoulder => LEFT_SHOULDER,
+        Action::RightShoulder => RIGHT_SHOULDER,
+        Action::LeftStick => LEFT_STICK,
+        Action::RightStick => RIGHT_STICK,
+        _ => return None,
+    })
+}
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -116,25 +125,32 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
+    use victory_core::input::Action;
+    let on = |vk: u8| keys.iter().any(|k| k.virtual_key == vk);
+    let mut pad = PadState::default();
+    for (action, key) in bindings().pairs() {
+        if let Some(bit) = button_bit(action) {
+            if on(key) {
+                pad.buttons |= bit;
+            }
+            continue;
         }
-    };
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        let down = on(key);
+        match action {
+            Action::LeftTrigger => pad.left_trigger = if down { 1.0 } else { 0.0 },
+            Action::RightTrigger => pad.right_trigger = if down { 1.0 } else { 0.0 },
+            Action::LeftUp if down => pad.left_y += 1.0,
+            Action::LeftDown if down => pad.left_y -= 1.0,
+            Action::LeftLeft if down => pad.left_x -= 1.0,
+            Action::LeftRight if down => pad.left_x += 1.0,
+            Action::RightUp if down => pad.right_y += 1.0,
+            Action::RightDown if down => pad.right_y -= 1.0,
+            Action::RightLeft if down => pad.right_x -= 1.0,
+            Action::RightRight if down => pad.right_x += 1.0,
+            _ => {}
+        }
     }
+    pad
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -1200,7 +1216,11 @@ mod host {
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    let button = super::bindings()
+                        .pairs()
+                        .find(|&(_, key)| key == vk)
+                        .and_then(|(action, _)| super::button_bit(action));
+                    if let Some(button) = button {
                         pad.buttons |= button;
                     }
                 }

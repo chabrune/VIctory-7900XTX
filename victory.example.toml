@@ -17,3 +17,53 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[display]
+# How the title is shown: 'windowed' (a normal window, fitted to the
+# screen), 'borderless' (no frame, covering one screen: fullscreen that
+# still alt-tabs like a window) or 'fullscreen' (the same window today:
+# Windows 10/11 show a flip-model swap chain covering the screen directly,
+# with exclusive mode's latency, tearing and G-Sync/FreeSync; DXGI's own
+# exclusive mode is not used, it deadlocks against the title's window).
+# Default: 'windowed'.                    env: VICTORY_WINDOW_MODE
+mode = 'windowed'
+
+# Which screen, in the system's order (0 is the main one).
+# Default: 0.                             env: VICTORY_MONITOR
+monitor = 0
+
+# Wait for the screen between frames. On removes tearing and caps the
+# frame rate at the screen's; off presents as soon as a frame is ready.
+# Default: false (what every measured run used).  env: VICTORY_VSYNC
+vsync = false
+
+# At most this many frames a second; 0 for no cap. A cap above the
+# title's own rate changes nothing.       env: VICTORY_FPS_LIMIT
+frame_limit = 0
+
+[log]
+# Where the log also goes, besides the console. Default: the cache's
+# logs\victory.log. 'off' keeps it on the console only.
+# env: VICTORY_LOG_FILE ('off' for none)
+# file = 'D:\victory-data\victory.log'
+
+[input]
+# The keyboard's stand-in gamepad, used while no pad is connected. Every
+# action is optional; the values below are the defaults. A key is one
+# letter or digit (a, z, 5) or a name: escape, tab, enter, space, up, down,
+# left, right, f1..f24, numpad0..numpad9, insert, delete, home, end,
+# pageup, pagedown, shift, ctrl, alt, lshift, rshift, lctrl, rctrl.
+# Punctuation keys cannot be named (they move between keyboard layouts).
+# '' or 'off' unbinds one.
+#
+# menu = 'Escape'      view = 'Tab'        a = 'Enter'       b = 'Backspace'
+# x = 'X'              y = 'Y'
+# up = 'up'            down = 'down'       left = 'left'     right = 'right'
+# lb = 'Q'             rb = 'E'            ls = 'F'          rs = 'H'
+# lt = 'Z'             rt = 'C'
+# ls_up = 'W'          ls_down = 'S'       ls_left = 'A'     ls_right = 'D'
+# rs_up = 'I'          rs_down = 'K'       rs_left = 'J'     rs_right = 'L'
+#
+# A French keyboard, for instance:
+# ls_up = 'Z'
+# ls_left = 'Q'

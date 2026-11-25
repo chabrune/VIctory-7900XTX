@@ -14,6 +14,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
@@ -117,6 +120,7 @@ pub extern "system" fn CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    place(hwnd, parent, style, width, height);
     hook(hwnd);
     hwnd
 }
@@ -143,6 +147,7 @@ pub extern "system" fn CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    place(hwnd, parent, style, width, height);
     hook(hwnd);
     hwnd
 }
@@ -224,6 +229,105 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
         (f64::from(width) * scale) as i32,
         (f64::from(height) * scale) as i32,
     )
+}
+
+/// Puts a title's top-level window on the screen the display settings ask
+/// for: windowed leaves it as created ([`fit`] shrinks it to the screen),
+/// borderless and fullscreen strip its frame and cover the whole screen.
+/// Small windows without a frame (a splash, a tool window) are left alone.
+fn place(hwnd: HWND, parent: HWND, style: u32, width: i32, height: i32) {
+    if hwnd.is_null() || !parent.is_null() {
+        return;
+    }
+    let display = victory_core::display::settings();
+    if display.mode == victory_core::display::Mode::Windowed {
+        return;
+    }
+    let framed = style & (wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_BORDER) != 0;
+    if !framed && (width < 960 || height < 540) {
+        return;
+    }
+    let (_, whole) = screen(display.monitor);
+    // SAFETY: a window this thread has just made, not yet handled by the
+    // title's loop; nothing else uses it.
+    unsafe {
+        wm::SetWindowLongW(hwnd, wm::GWL_STYLE, (wm::WS_POPUP | wm::WS_VISIBLE) as i32);
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            whole.left,
+            whole.top,
+            whole.right - whole.left,
+            whole.bottom - whole.top,
+            wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER,
+        );
+    }
+    let (mode, screen) = (display.mode.as_str(), display.monitor);
+    tracing::info!(mode, screen, "title window placed");
+}
+
+/// The work area and the whole bounds of screen `index` (0 first), in the
+/// virtual screen's coordinates; the main screen's when there is no such
+/// screen.
+fn screen(index: usize) -> (RECT, RECT) {
+    struct Found {
+        wanted: usize,
+        seen: usize,
+        work: RECT,
+        whole: RECT,
+    }
+    unsafe extern "system" fn visit(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> i32 {
+        // SAFETY: `data` is the `Found` the enumeration was given.
+        let found = unsafe { &mut *(data as *mut Found) };
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a monitor the system just named; `info` is ours.
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 && found.seen == found.wanted {
+            found.work = info.rcWork;
+            found.whole = info.rcMonitor;
+        }
+        found.seen += 1;
+        1
+    }
+    let mut found = Found {
+        wanted: index,
+        seen: 0,
+        work: RECT::default(),
+        whole: RECT::default(),
+    };
+    // SAFETY: the callback only writes `found`, which outlives the call.
+    let listed =
+        unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(visit), &raw mut found as LPARAM) };
+    if listed == 0 || found.seen <= index {
+        let mut area = RECT::default();
+        // SAFETY: `area` receives the primary monitor's work area.
+        let known = unsafe {
+            wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0)
+        };
+        if known == 0 {
+            let (wide, tall) = unsafe {
+                (
+                    wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                    wm::GetSystemMetrics(wm::SM_CYSCREEN),
+                )
+            };
+            area = RECT {
+                left: 0,
+                top: 0,
+                right: wide,
+                bottom: tall,
+            };
+        }
+        return (area, area);
+    }
+    (found.work, found.whole)
 }
 
 /// Puts our procedure in front of the title's.

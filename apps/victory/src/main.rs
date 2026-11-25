@@ -249,6 +249,25 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!(
+        "log_file    : {}",
+        cfg.log_file
+            .as_ref()
+            .map_or_else(|| "(console only)".to_owned(), |p| p.display().to_string())
+    );
+    println!(
+        "display     : {} on screen {}, vsync {}, frame cap {}",
+        cfg.display.mode.as_str(),
+        cfg.display.monitor,
+        if cfg.display.vsync { "on" } else { "off" },
+        cfg.display
+            .frame_limit
+            .map_or_else(|| "none".to_owned(), |fps| format!("{fps} fps"))
+    );
+    println!("input       : the keyboard's stand-in gamepad");
+    for (action, key) in cfg.input.pairs() {
+        println!("  {:<10} : {}", action.as_str(), victory_core::input::key_name(key));
+    }
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
