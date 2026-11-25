@@ -4,12 +4,17 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Console      series-x (the default: 3840x2160) or series-s: the title renders lower and
+#               scales up to 1920x1080 itself; on an RX 7700 XT 17-20 fps in the opening
+#               cutscene against about 10 (2026-11-26). Its menus show black: press Enter
+#               (or A) on the black screen and the title goes on.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -35,4 +40,4 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
