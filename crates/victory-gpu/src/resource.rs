@@ -1706,8 +1706,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072, and 1,536 on
+/// the Series S profile; 0: none, as before) less what such copies hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1729,7 +1729,20 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                // The measurements above are of the Series X profile, whose
+                // targets are 3840x2160. The Series S profile's (1280x720
+                // scaled up to 1920x1080) came to 1,352 MB two minutes into
+                // the world and stayed there (run g1, an RX 7700 XT,
+                // 2026-11-26), so 1,720 MB of the card were kept for targets
+                // that never came, while 4,000 to 9,000 textures waited for
+                // room and the blocks made for textures stood 2.4 GB empty.
+                || match crate::console::current() {
+                    crate::console::Console::SeriesS => 1536 << 20,
+                    crate::console::Console::SeriesX => 3072 << 20,
+                },
+                |mb| mb.min(8192) << 20,
+            )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
