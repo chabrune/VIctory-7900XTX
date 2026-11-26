@@ -169,12 +169,136 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 
 /// Blocks of the title's general allocator that are allocations of their own
 /// (`xmem`'s `alloc_watched`): the first byte of each and its bytes.
-static BLOCKS: std::sync::Mutex<BTreeMap<usize, usize>> = std::sync::Mutex::new(BTreeMap::new());
+static BLOCKS: std::sync::Mutex<BTreeMap<usize, Block>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// One of them.
+struct Block {
+    len: usize,
+    /// Whether anything on the CPU has touched it; true from the start for
+    /// one the runtime does not keep from the CPU.
+    touched: bool,
+    /// Who touched it first: the instruction, 0 a read, 1 a write, 2 the
+    /// kernel for the title; whether in a copy of ours (`crate::safecopy`);
+    /// the thread; milliseconds since it was made.
+    first: Option<(usize, u8, bool, u32, u64)>,
+    made: std::time::Instant,
+    /// Nobody was told yet that it is zeroed ([`block_take_fresh`]).
+    fresh: bool,
+}
 
 /// The runtime made such a block: `len` bytes at `at`, private memory
-/// committed whole, on a 64 KiB page of its own.
-pub fn title_block(at: usize, len: usize) {
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, len);
+/// committed whole, on a 64 KiB page of its own. `kept`: its pages are not
+/// to be read or written (`PAGE_NOACCESS`) until something does
+/// ([`block_fault`] opens them then and notes who).
+pub fn title_block(at: usize, len: usize, kept: bool) {
+    let block = Block { len, touched: !kept, first: None, made: std::time::Instant::now(), fresh: true };
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, block);
+    SAID.store(0, Ordering::Relaxed);
+}
+
+/// When [`blocks_line`] last spoke (ms; 0: something changed since).
+static SAID: AtomicU64 = AtomicU64::new(0);
+
+/// A read or write of `at` faulted: if it lies in a block kept from the CPU
+/// and not touched yet, the block is opened for good and who did it noted;
+/// true if the access can be tried again. `kind` as in [`Block::first`].
+/// Called from the fault handler: nothing here waits for anything but the
+/// table's own lock, which nobody holds while touching title memory.
+pub(crate) fn block_fault(at: usize, kind: u8, site: usize, ours: bool) -> bool {
+    let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((&start, block)) = blocks.range_mut(..=at).next_back() else {
+        return false;
+    };
+    if at >= start + block.len {
+        return false;
+    }
+    if block.touched {
+        // Opened by another thread since this one faulted: again. (For
+        // any other reason it is not ours to answer.)
+        return private_whole(at & !(K64 - 1), 1);
+    }
+    let mut old = 0;
+    // SAFETY: an allocation of the runtime's, alive while it is in the table.
+    let ok = unsafe { mem::VirtualProtect(start as *const c_void, block.len, mem::PAGE_READWRITE, &mut old) } != 0;
+    block.touched = true;
+    // SAFETY: no arguments.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    block.first = Some((site, kind, ours, thread, block.made.elapsed().as_millis() as u64));
+    SAID.store(0, Ordering::Relaxed);
+    ok
+}
+
+/// The kernel is about to write `[at, at + len)` for the title (a file
+/// read): blocks kept from the CPU there are opened first, since the kernel
+/// does not fault into our handler.
+pub(crate) fn blocks_opening(at: usize, len: usize) {
+    let starts: Vec<usize> = {
+        let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        blocks.iter().filter(|(s, b)| !b.touched && **s < at.saturating_add(len) && at < **s + b.len).map(|(s, _)| *s).collect()
+    };
+    for start in starts {
+        block_fault(start.max(at), 2, 0, false);
+    }
+}
+
+/// Whether `[at, at + len)` is the start of a block the system has just
+/// handed out zeroed, asked for the first time: true once for each block.
+/// (A committed resource's memory is zeroed; these 7 to 20 MB were written
+/// over with zeros they already held, which made every page of them the
+/// PC's memory, and was the first touch of each.)
+pub(crate) fn block_take_fresh(at: usize, len: usize) -> bool {
+    let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    blocks.get_mut(&at).is_some_and(|b| len <= b.len && std::mem::take(&mut b.fresh))
+}
+
+/// Pieces of copies in untouched blocks that a landing did not fetch.
+static LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// A landing left `pieces` pieces on the card ([`block_untouched`]).
+pub(crate) fn left_on_card(pieces: u64) {
+    LEFT.fetch_add(pieces, Ordering::Relaxed);
+}
+
+/// Whether nothing on the CPU has touched the block that holds `[start,
+/// start + len)` since the runtime made it (false if no block holds it).
+pub(crate) fn block_untouched(start: u64, len: u64) -> bool {
+    let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    blocks.range(..=start as usize).next_back().is_some_and(|(&at, b)| !b.touched && start + len <= (at + b.len) as u64)
+}
+
+/// The blocks and who touched each first, when something changed and every
+/// minute.
+pub(crate) fn blocks_line() {
+    let now = crate::host::now_ms().max(1);
+    let said = SAID.load(Ordering::Relaxed);
+    if said != 0 && now < said + 60_000 {
+        return;
+    }
+    SAID.store(now, Ordering::Relaxed);
+    let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if blocks.is_empty() {
+        return;
+    }
+    let told: Vec<String> = blocks
+        .iter()
+        .map(|(at, b)| {
+            let who = match (b.touched, b.first) {
+                (false, _) => "untouched".to_owned(),
+                (true, None) => "not kept".to_owned(),
+                (true, Some((site, kind, ours, thread, ms))) => format!(
+                    "first {} after {ms} ms by thread {thread} at {site:#x}{}",
+                    ["read", "written", "written by the kernel"][usize::from(kind.min(2))],
+                    if ours { " (a copy of ours)" } else { "" }
+                ),
+            };
+            format!("{at:#x}+{:#x} {who}", b.len)
+        })
+        .collect();
+    tracing::info!(
+        "blocks of the title's general allocator kept from the CPU until touched (VICTORY_ALLOC_KEPT=1): {}; {} pieces of copies in untouched ones left on the card so far and not fetched",
+        told.join("; "),
+        LEFT.load(Ordering::Relaxed)
+    );
 }
 
 /// The title freed the block at `at` (after [`title_memory_freeing`]).
@@ -217,8 +341,10 @@ pub(crate) fn place_block(start: u64, len: u64) -> Option<Placed> {
     }
     {
         let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
-        let (&at, &bytes) = blocks.range(..=start as usize).next_back()?;
-        if start + len > (at + bytes) as u64 {
+        let (&at, block) = blocks.range(..=start as usize).next_back()?;
+        // (One kept from the CPU is not opened as a heap: its pages are
+        // not of one protection the host takes.)
+        if start + len > (at + block.len) as u64 || !block.touched {
             return None;
         }
     }

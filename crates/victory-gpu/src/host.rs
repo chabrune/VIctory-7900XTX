@@ -3668,6 +3668,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     crate::port::log(frames);
+    crate::inplace::blocks_line();
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -4681,6 +4682,14 @@ impl Host {
                 let fetched = flagged_pieces(&flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    // In a block nothing on the CPU has touched
+                    // (`VICTORY_ALLOC_KEPT=1`): what shaders wrote there stays
+                    // on the card, where the only readers are.
+                    let (start, len) = r.shadow.span();
+                    if crate::inplace::block_untouched(start, len) {
+                        crate::inplace::left_on_card(u64::from(r.span.pieces));
+                        continue;
+                    }
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }

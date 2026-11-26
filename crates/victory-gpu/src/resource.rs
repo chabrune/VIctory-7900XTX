@@ -1008,8 +1008,15 @@ impl Memory {
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
-        // SAFETY: the allocator handed out `size` bytes.
-        unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        // (Not a block the system has just handed out zeroed.)
+        #[cfg(windows)]
+        let zeroed = crate::inplace::block_take_fresh(ptr.as_ptr() as usize, layout.size());
+        #[cfg(not(windows))]
+        let zeroed = false;
+        if !zeroed {
+            // SAFETY: the allocator handed out `size` bytes.
+            unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        }
         Ok(Memory {
             ptr,
             layout,

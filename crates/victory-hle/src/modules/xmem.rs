@@ -401,7 +401,16 @@ fn alloc_watched(size: usize, align: usize) -> Option<*mut c_void> {
     let user = (base + BLOCK).next_multiple_of(align);
     // SAFETY: the page below `user` is ours and committed.
     unsafe { ((user - HEADER) as *mut [usize; 2]).write([base, WATCHED]) };
-    victory_gpu::title_block(user, base + bytes - user);
+    // `VICTORY_ALLOC_KEPT=1` (off): the block's pages are not to be read or
+    // written until something on the CPU does, which the log then names
+    // (`victory_gpu::title_block`): who touches what only shaders write.
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kept = *KEPT.get_or_init(|| std::env::var_os("VICTORY_ALLOC_KEPT").is_some_and(|v| v == "1")) && {
+        let mut old = 0;
+        // SAFETY: the pages of the block just made, from its first byte on.
+        unsafe { windows_sys::Win32::System::Memory::VirtualProtect(user as *const c_void, base + bytes - user, PAGE_NOACCESS, &mut old) != 0 }
+    };
+    victory_gpu::title_block(user, base + bytes - user, kept);
     tracing::info!(mb = size >> 20, at = format_args!("{user:#x}"), "a block of the title's general allocator in an allocation of its own, write-watched (VICTORY_ALLOC_WATCHED=0: not)");
     Some(user as *mut c_void)
 }
