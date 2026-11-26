@@ -221,10 +221,15 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
-            struct Over;
+            struct Over(u64);
             impl Drop for Over {
                 fn drop(&mut self) {
-                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+                    // Every round asked for before this one began is done
+                    // with it: what was written when each was asked is what
+                    // this one looked at.
+                    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                    rounds.1 = rounds.1.max(self.0);
+                    drop(rounds);
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
@@ -246,10 +251,11 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                         break;
                     }
                 }
+                let upto = r.0;
                 drop(r);
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
-                    Over
+                    Over(upto)
                 });
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
@@ -268,6 +274,32 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
+}
+
+/// A round of [`sync_heaps`] asked for when the title gives its lists to a
+/// queue, and not when the submitting thread comes to them, a frame of work
+/// later: the number to wait for with [`synced_from`], or 0 where a
+/// submission asks itself as before (`VICTORY_HEAPS_AT_SUBMIT=0`: always).
+///
+/// The records a submission's lists read are written when the title gives
+/// the lists to its queue (the console's card may run them at once), so a
+/// round begun after that has them. The submitting thread asked for one per
+/// part it sends, 19 a frame for the title's two or three calls, each when it
+/// came to the part, and then stood 6 to 7.5 ms a frame at the parts' ends
+/// until its round was over (an RX 7700 XT, Series S profile, 2026-11-26).
+#[cfg(windows)]
+pub(crate) fn ask_sync_heaps() -> u64 {
+    if !crate::toggled!("VICTORY_HEAPS_AT_SUBMIT") {
+        return 0;
+    }
+    begin_sync_heaps().0.take().unwrap_or(0)
+}
+
+/// What [`begin_sync_heaps`] gives, for a round asked for with
+/// [`ask_sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn synced_from(round: u64) -> SyncedHeaps {
+    SyncedHeaps(Some(round))
 }
 
 #[cfg(windows)]

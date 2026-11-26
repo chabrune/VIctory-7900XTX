@@ -807,13 +807,23 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
         )
     });
     let mut jobs: Vec<Job> = Vec::new();
+    // The heaps' records as they are now are what these lists read: one
+    // round for all their parts, begun here.
+    let round = crate::descriptor::ask_sync_heaps();
+    let told = |taken: &[crate::list::Detached]| {
+        for list in taken {
+            list.host().heaps_round.store(round, Relaxed);
+        }
+    };
     if first > 0 {
         let (taken, order) = crate::list::detach(&lists[..first]);
+        told(&taken);
         jobs.push(Job::Run(queue, taken, order));
     }
     if first < lists.len() {
         for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
             jobs.extend(waits.into_iter().map(Job::Value));
+            told(&taken);
             jobs.push(Job::Run(queue, taken, order));
         }
     }

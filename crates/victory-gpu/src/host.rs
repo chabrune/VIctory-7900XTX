@@ -1153,6 +1153,9 @@ const BATCHES: u32 = 8;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    /// The round of the heaps' records asked for when the title gave this
+    /// list to its queue (`crate::descriptor::ask_sync_heaps`); 0: none.
+    pub(crate) heaps_round: std::sync::atomic::AtomicU64,
     allocator: ID3D12CommandAllocator,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
@@ -4109,6 +4112,7 @@ impl Host {
                 );
             }
             Ok(HostList {
+                heaps_round: std::sync::atomic::AtomicU64::new(0),
                 allocator,
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
@@ -5525,7 +5529,14 @@ impl Host {
         // title's, written before it submitted: nothing those two stages do
         // changes them. `VICTORY_HEAPS_EARLY=0`: set going after them, as
         // before.
-        let heaps_early = crate::toggled!("VICTORY_HEAPS_EARLY").then(crate::descriptor::begin_sync_heaps);
+        // Or it was asked for when the title gave the lists to its queue
+        // (`crate::descriptor::ask_sync_heaps`): the newest of their rounds.
+        let asked = runs.iter().map(|l| l.heaps_round.swap(0, Ordering::Relaxed)).max().unwrap_or(0);
+        let heaps_early = if asked > 0 {
+            Some(crate::descriptor::synced_from(asked))
+        } else {
+            crate::toggled!("VICTORY_HEAPS_EARLY").then(crate::descriptor::begin_sync_heaps)
+        };
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
