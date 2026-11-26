@@ -3936,11 +3936,15 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9 ([`super::legacy_mul`]: the check may
+    /// be left out, `VICTORY_LEGACY_MUL=0`).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if !super::legacy_mul() {
+            return m;
+        }
         if host_rdna() & super::rdna::LEGACY != 0 {
-            let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
             // A product is not 0 only where one factor is 0 and the other an
             // infinity or no number: never of a value with itself, nor of two
@@ -3961,7 +3965,6 @@ impl<'a> Lower<'a> {
             let z = self.s.m.cmp(c, pred::OEQ, asked, zero);
             return self.s.m.select(c, z, zero, m);
         }
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);

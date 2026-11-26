@@ -245,6 +245,26 @@ pub fn rdna_float() -> u32 {
     })
 }
 
+/// Whether `v_mul_legacy_f32` (and its accumulate and add forms) keep the
+/// console's rule that a product with a zero factor is zero, whatever the
+/// other factor is (0 × ∞ and 0 × NaN are 0 there). `VICTORY_LEGACY_MUL=0`
+/// writes the plain product instead.
+///
+/// The rule costs, for every product whose factors are not known finite, the
+/// smaller magnitude of the two, a compare against zero and a select — three
+/// instructions where the console has one. `v_mul_legacy_f32` is what the
+/// console's compiler writes for nearly every multiply (2,270 of the 19,846
+/// instructions of one of the title's compute programs), so in those programs
+/// roughly one instruction in nine pays for it. Without the rule only a
+/// product of a zero and an infinity or a NaN differs; every other pair of
+/// values gives the same bits (the sign of a zero may differ).
+///
+/// Part of the translation: the shader cache keys on it.
+pub fn legacy_mul() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_MUL").is_none_or(|v| v != "0"))
+}
+
 /// The bits of [`rdna_float`].
 pub mod rdna {
     /// `v_max_f32` and the like: the host's FMax and FMin, without the code
@@ -282,6 +302,7 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
 /// translator alone keeps its translations. Call it after the device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
     let mut out = Vec::new();
+    out.push(u8::from(legacy_mul()));
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
