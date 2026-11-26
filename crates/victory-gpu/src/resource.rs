@@ -1285,6 +1285,12 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
 
 /// The share of the card's local VRAM budget in use, in percent (cached for
 /// a tenth of a second via [`crate::host::now_ms`]).
+///
+/// Less what the blocks of textures hold free, as [`room`] and the sweep
+/// count it: new textures take that first. Counted whole, an RX 7700 XT
+/// stood over 97 % for good once its blocks had been at their most (10.4 GB
+/// in use of a 10.1 GB budget with 1.8 GB of the blocks free, run rt-low2),
+/// and every texture made from then on would have been one of 256.
 #[cfg(windows)]
 fn video_memory_percent() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1296,7 +1302,10 @@ fn video_memory_percent() -> u64 {
     }
     let pct = crate::host::host()
         .and_then(|h| h.video_memory())
-        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64))
+        .and_then(|[budget, used, ..]| {
+            let used = used.saturating_sub(crate::pool::texture_room());
+            (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64)
+        })
         .unwrap_or(0);
     LAST.store((tenth << 8) | pct, Relaxed);
     pct

@@ -20,6 +20,7 @@ $s = [ordered]@{
     Output     = 'jeu'
     Anisotropy = '16'
     Upscaler   = '6'
+    RenderScale = 'jeu'
     Sharpness  = '0.5'
     TextureStore = '0'
     Ambient    = '0.8'
@@ -61,10 +62,11 @@ $menu = @(
     @{ K = 'Output'; N = 'Résolution de sortie du jeu'; V = @('jeu', '1280x720', '1664x936', '1920x1080', '2560x1440', '3840x2160'); H = 'jeu : celle du profil (1080p en series-s, 4K en series-x). Autres tailles : expérimental, en series-s le jeu s''arrête au démarrage en 2560x1440' }
     @{ K = 'Anisotropy'; N = 'Filtrage anisotrope'; V = @('0', '2', '4', '8', '16'); H = '0 : ce que le jeu demande ; 16 : sols et murs plus nets de biais, sans coût mesuré' }
     @{ K = 'Upscaler'; N = 'Mise à l''échelle de l''image'; V = @('6', '7'); H = '6 : celle du jeu, image lisse (conseillé) ; 7 : FidelityFX, ici en mode de secours : image en pointillés' }
+    @{ K = 'RenderScale'; N = 'Échelle de rendu (series-s)'; V = @('jeu', '0.6', '0.55', '0.5'); H = 'jeu : 2/3 de la sortie (1280x720 pour 1080p) ; 0.5 : 960x540, image plus douce, la carte travaille 3 ms de moins par image (24,9 ms contre 28,2 sur RX 7700 XT). Ne rapporte des images que dans les scènes où la carte seule limite ; series-s et mise à l''échelle du jeu (6) uniquement' }
     @{ K = 'Sharpness'; N = 'Netteté (avec FidelityFX, la 7)'; V = @(); H = 'de 0 (aucune) à 1 ; 0.5 conseillé ; sans effet avec la mise à l''échelle du jeu' }
     @{ K = 'TextureStore'; N = 'Magasin de textures sur disque'; V = @('0', '1'); H = '1 : les textures déjà vues s''affichent tout de suite en pleine définition la fois suivante ; prend environ 2 Go de mémoire vive en plus (à éviter avec 32 Go) et de la place sur le disque (1,5 Go pour trois minutes de jeu, dans %LOCALAPPDATA%\victory-7900xtx\texture-store, à effacer pour repartir de zéro)' }
     @{ K = 'Ambient'; N = 'Lumière ambiante estimée'; V = @(); H = '0 : sortie du jeu telle quelle ; 0.8 conseillé (intérieurs moins noirs sans ray tracing)' }
-    @{ K = 'RayTracing'; N = 'Ray tracing du jeu'; V = @('0', 'bas', '1'); H = '0 : sans (lumière ambiante estimée à la place) ; bas : éclairage indirect par rayons calculé une image sur trois, environ 30 img/s sur RX 7700 XT (conseillé) ; 1 : calculé à chaque image, 16-18 img/s' }
+    @{ K = 'RayTracing'; N = 'Ray tracing du jeu'; V = @('0', 'bas', '1'); H = '0 : sans (lumière ambiante estimée à la place) ; bas : éclairage indirect par rayons calculé une image sur trois à six, 33 img/s dans la première scène jouée et 28-31 dans la cinématique d''ouverture sur RX 7700 XT (conseillé) ; 1 : calculé à chaque image, 16-18 img/s' }
     @{ K = 'Safe'; N = 'Mode sûr'; V = @('0', '1'); H = '1 : sans les chemins rapides récents, à essayer d''abord si quelque chose ne va pas' }
     @{ K = 'Build'; N = 'Version du programme'; V = @('diag', 'release'); H = 'diag : celle de toutes les mesures (avec diagnostics) ; release : sans diagnostics' }
     @{ K = 'Extra'; N = 'Réglages libres'; V = @(); H = 'NOM=valeur séparés par des virgules, par ex. VICTORY_PANEL=1 ; vide : aucun' }
@@ -151,6 +153,9 @@ if ($s.RayTracing -eq '1') { $arguments.RayTracing = $true }
 if ($s.RayTracing -eq 'bas') { $arguments.RayTracingLow = $true }
 if ($s.Safe -eq '1') { $arguments.Safe = $true }
 if ($s.TextureStore -eq '1') { $arguments.TextureStore = $true }
+if ($s.RenderScale -ne 'jeu' -and $s.Console -eq 'series-s' -and $s.Upscaler -eq '6') {
+    $arguments.RenderScale = [double]::Parse($s.RenderScale, [Globalization.CultureInfo]::InvariantCulture)
+}
 Write-Host ''
 Write-Host "Lancement : profil $($s.Console), cadence $($s.Clock), fenêtre $($s.Window), mise à l'échelle $($s.Upscaler), anisotrope $($s.Anisotropy), ray tracing $($s.RayTracing), magasin de textures $($s.TextureStore)." -ForegroundColor Green
 Write-Host '(Dans les menus du profil series-s, l''écran peut rester noir : appuyez sur Entrée ou A et le jeu continue.)'

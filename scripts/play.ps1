@@ -2,8 +2,12 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about half the frame rate
-# -RayTracingLow the same light with the title's trace programs run one frame in three, by turns
-#               (what they wrote stands in between): about 30 frames a second on an RX 7700 XT
+# -RayTracingLow the same light with the title's trace programs run one frame in three to six, by
+#               turns (what they wrote stands in between): 33 frames a second in the first scene
+#               that is played on an RX 7700 XT, 28-31 in the opening cutscene
+# -RenderScale  series-s: the size the title renders at, as a share of the output's width and
+#               height, 0.5 to 0.66 (2/3 without it: 1280x720 for 1920x1080; 0.5: 960x540). A
+#               softer picture for less of the card's work (see below).
 # -TextureStore keeps the textures' larger levels on disk so that they show at once next time
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance), series-x only;
 #               after Belobug/VIctory-Belobug-AMD cd8dfc0 (README.md says where its DLL comes from)
@@ -19,6 +23,7 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$RayTracingLow,
+    [ValidateRange(0.5, 0.67)][double]$RenderScale,
     [switch]$TextureStore,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
@@ -36,7 +41,19 @@ if ($Safe) {
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
-if ($RayTracing -or $RayTracingLow) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($RayTracing -or $RayTracingLow) {
+    $settings.VICTORY_BVH_BUILDER = '1'
+    # With ray tracing the title's memory is given to shaders by address (crates/victory-gpu/
+    # src/memory.rs), in some twenty arenas of 64 MiB. The title's pool-wide buffers and the
+    # arenas are left to the write guards instead of asked of the kernel whole by every
+    # submission that traces or builds (480 askings over 1.7 GB in 3.5 ms a frame against 618
+    # over 6.7 GB in 8.9), and an arena is nothing but its copy (no memory of its own: the PC
+    # had 4.3-4.4 GB free in the first played scene against 2.4-2.8, runs w1 and s50b against
+    # g1 and p1, RX 7700 XT with 32 GB, 2026-11-26; the picture the same).
+    # -More @{VICTORY_QUIET_GUARD='0'; VICTORY_MEMORY_DIRECT='0'}: as before.
+    $settings.VICTORY_QUIET_GUARD = '1'
+    $settings.VICTORY_MEMORY_DIRECT = '1'
+}
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($RayTracingLow) {
     # The title's 13 trace programs (those that test rays against its structures) each run
@@ -140,9 +157,21 @@ if ($Console -eq 'series-s') {
     # is a dotted, pixelated picture (hair, shadow edges, anything the title dithers and leaves
     # to the upscaler to smooth). The title's own smooths them; same render size (1280x720 to
     # 1920x1080), same frame rate. -More @{VICTORY_UPSCALER='7'}: FidelityFX, as before.
-    # (Its render scale, VICTORY_RENDER_SCALE, ends the title at its start on this profile,
-    # as the other sizes do: 0.8 tried.)
+    # Its render scale (VICTORY_RENDER_SCALE, -RenderScale) can go down from 2/3, not up (0.8
+    # ends the title at its start on this profile, as the other output sizes do). At 0.5
+    # (960x540) with -RayTracingLow, the first played scene, RX 7700 XT (2026-11-26, runs g1
+    # and s50b): the card works 24.9 ms a frame against 28.2, and the frame is the same 29 to
+    # 30 ms (33 fps), because the thread that prepares submissions, at 26 ms, is then what it
+    # waits for. So it pays only where the card alone sets the frame (the dormitory that
+    # follows: 39-43 ms of the card against 41-47), for a softer picture: off unless asked.
     $settings.VICTORY_UPSCALER = '6'
+    if ($RenderScale) { $settings.VICTORY_RENDER_SCALE = $RenderScale.ToString([Globalization.CultureInfo]::InvariantCulture) }
+    # A list's prelude (the states of its textures, and since the merge of Belobug/VIctory-
+    # Belobug-AMD 5d6bd84 the uploads of the title's textures) is a list from a pool on the
+    # list's own allocator: 49 to 51 preludes made in a run against 1,400, each of which took
+    # 1.1 MiB of the PC's memory for good on an RX 7700 XT (about 1.6 GB; every run of
+    # 2026-11-26 from rt-low1 on). -More @{VICTORY_PRELUDE_POOL='0'}: as before.
+    $settings.VICTORY_PRELUDE_POOL = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 

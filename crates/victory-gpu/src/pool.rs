@@ -329,10 +329,16 @@ impl<B: Clone> Pool<B> {
                 any |= block.free.whole(BLOCK);
             }
         }
-        // (Without a piece given back too, once there is less room.)
+        // (Without a piece given back too, once there is less room. What it
+        // was last told is kept at every call: kept only when it let blocks
+        // go, the first drop from 64 to 2 was not seen while no block had
+        // come back whole, and the blocks made ahead while the card had room
+        // stayed: 7 of them, 448 MB, with the card at 99 % of its budget,
+        // run p1.)
         let most = limit.min(self.most);
-        if sweep || any || most < self.spare {
-            self.spare = most;
+        let fewer = most < self.spare;
+        self.spare = most;
+        if sweep || any || fewer {
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
@@ -979,6 +985,23 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    /// Blocks made while the card had room go when it has none left, though
+    /// no piece came back meanwhile.
+    #[test]
+    fn empty_blocks_go_when_the_room_does() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let (_held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        for i in 0..7 {
+            pool.add(i, 0);
+        }
+        // Told to keep many: nothing goes.
+        pool.reclaim(0, SPARE_KEPT, false);
+        assert_eq!(pool.blocks(), 8);
+        // Told to keep few, with nothing given back since.
+        pool.reclaim(1, SPARE, false);
+        assert_eq!(pool.blocks(), SPARE + 1);
     }
 
     #[test]
