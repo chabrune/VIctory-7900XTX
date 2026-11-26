@@ -396,7 +396,57 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    unknown_pipeline_census(SLOT, desc);
     E_NOTIMPL
+}
+
+/// Diagnostics: how many different pipelines the title asks of the two
+/// methods above, told apart by the words of their description that name
+/// shader code (the code's addresses, and for 0x218 its 64-bit hash), and how
+/// often a second: a title that asks again every frame for what failed shows
+/// a rate near its frame rate. Logged every ten seconds.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn unknown_pipeline_census(slot: usize, desc: *const u8) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    struct Census {
+        seen: [HashSet<[u64; 3]>; 2],
+        calls: [u64; 2],
+        since: Option<std::time::Instant>,
+    }
+    static CENSUS: Mutex<Option<Census>> = Mutex::new(None);
+    let mut bytes = [0u8; 96];
+    if desc.is_null() || !crate::host::read_into(desc, &mut bytes) {
+        return;
+    }
+    let word = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    // 0x1c8: two stages' code at words 5 and 9; 0x218: code at word 5 and a
+    // hash at word 11.
+    let (which, key) = if slot == 0x218 { (1, [word(5), word(11), word(6)]) } else { (0, [word(5), word(9), word(6)]) };
+    let mut guard = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let census = guard.get_or_insert_with(|| Census {
+        seen: [HashSet::new(), HashSet::new()],
+        calls: [0, 0],
+        since: Some(std::time::Instant::now()),
+    });
+    census.seen[which].insert(key);
+    census.calls[which] += 1;
+    let since = *census.since.get_or_insert_with(std::time::Instant::now);
+    if since.elapsed() >= std::time::Duration::from_secs(10) {
+        let seconds = since.elapsed().as_secs_f64();
+        tracing::info!(
+            "pipelines asked of the unwritten methods in {seconds:.0} s: 0x1c8 {} calls ({:.1} a second), {} different so far; 0x218 {} calls ({:.1} a second), {} different so far",
+            census.calls[0],
+            census.calls[0] as f64 / seconds,
+            census.seen[0].len(),
+            census.calls[1],
+            census.calls[1] as f64 / seconds,
+            census.seen[1].len(),
+        );
+        census.calls = [0, 0];
+        census.since = Some(std::time::Instant::now());
+    }
 }
 
 /// The host device's state: the console's device is removed when the host's is
