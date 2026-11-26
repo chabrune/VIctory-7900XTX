@@ -331,6 +331,12 @@ own writes and sends some of it up again (17 MB a frame up, 14 of them that).
   flush: a window a draw reads vertices through, where a shader wrote them through the
   buffer's copy). The second kind is the card talking to itself by way of the PC.
 
+**The first part that is played is heavier than the cutscene.** One run (z1, the clock at
+30 Hz, the defaults) left the cutscene after 65 s and stood in the cell that follows: 5,800
+to 6,000 draws a frame against 4,400 to 4,600, 23 fps, the card waited for 8 to 10 ms a
+frame, the preparing thread 27 to 29 ms. Every figure above is the cutscene's; the walls
+are the same ones, the card's first.
+
 What is left of the 69 MB, and what each needs:
 
 1. Copies in views of the title's page pool (0xac6160000+0x3200000 alone 10 MB a frame, and
