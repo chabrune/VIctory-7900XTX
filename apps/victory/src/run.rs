@@ -158,6 +158,9 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // Two of the title's calls into its FidelityFX loader go through ours
+    // (`victory_hle::modules::fsr`), which call the loader's own.
+    let with_dlls = Intercepted { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -295,6 +298,27 @@ fn poke(base: usize, size: usize) {
 
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
+/// Resolves through `inner`, then puts the imports [`victory_hle::modules::fsr`]
+/// takes through it: the address found becomes the one it calls.
+struct Intercepted<'a> {
+    inner: &'a dyn victory_loader::ImportResolver,
+}
+
+impl victory_loader::ImportResolver for Intercepted<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        let found = self.inner.resolve(dll, symbol);
+        if let victory_loader::Resolution::Found { address, .. } = found
+            && let Some(ours) = victory_hle::modules::fsr::intercept(dll, &symbol.to_string(), address)
+        {
+            return victory_loader::Resolution::Found {
+                address: ours,
+                provenance: victory_loader::Provenance::Hle,
+            };
+        }
+        found
+    }
+}
+
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
