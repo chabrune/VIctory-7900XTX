@@ -49,11 +49,20 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    // `VICTORY_FRAME_US=<microseconds>`: our clock ticks at this interval
+    // whatever the title asks for (it asks for 33,333: 30 frames a second,
+    // and is paced by its wait for the flip before each present). The title
+    // is not told: what it does with a frame's time is its own.
+    static OURS: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    let ours = *OURS.get_or_init(|| {
+        std::env::var("VICTORY_FRAME_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&us| us >= 1000).map(Duration::from_micros)
+    });
+    let interval = ours.unwrap_or(asked);
+    tracing::info!(?interval, ?asked, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
