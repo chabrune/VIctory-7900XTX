@@ -401,6 +401,7 @@ fn alloc_watched(size: usize, align: usize) -> Option<*mut c_void> {
     let user = (base + BLOCK).next_multiple_of(align);
     // SAFETY: the page below `user` is ours and committed.
     unsafe { ((user - HEADER) as *mut [usize; 2]).write([base, WATCHED]) };
+    victory_gpu::title_block(user, base + bytes - user);
     tracing::info!(mb = size >> 20, at = format_args!("{user:#x}"), "a block of the title's general allocator in an allocation of its own, write-watched (VICTORY_ALLOC_WATCHED=0: not)");
     Some(user as *mut c_void)
 }
@@ -414,6 +415,7 @@ fn free_watched(user: usize, base: usize) {
     // What the card has in place there goes first: its heap holds the pages
     // while it stands.
     victory_gpu::title_memory_freeing(user, (base + info.RegionSize).saturating_sub(user));
+    victory_gpu::title_block_gone(user);
     // SAFETY: an allocation of ours that the title has freed.
     if unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) } == 0 {
         FREE_LATER.lock().unwrap_or_else(|e| e.into_inner()).push(base);

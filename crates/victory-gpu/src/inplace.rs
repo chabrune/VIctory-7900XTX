@@ -167,6 +167,75 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Blocks of the title's general allocator that are allocations of their own
+/// (`xmem`'s `alloc_watched`): the first byte of each and its bytes.
+static BLOCKS: std::sync::Mutex<BTreeMap<usize, usize>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// The runtime made such a block: `len` bytes at `at`, private memory
+/// committed whole, on a 64 KiB page of its own.
+pub fn title_block(at: usize, len: usize) {
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, len);
+}
+
+/// The title freed the block at `at` (after [`title_memory_freeing`]).
+pub fn title_block_gone(at: usize) {
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&at);
+}
+
+/// Whether title buffers in such blocks are the card's own memory
+/// (`VICTORY_ALLOC_INPLACE=1`; off).
+fn blocks_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALLOC_INPLACE").is_some_and(|v| v == "1"))
+}
+
+/// A title buffer `[start, start + len)` that lies in a block of
+/// [`title_block`], in place: the block's pages opened as a heap of the
+/// card's and a buffer placed over them, as [`place_for`] does for a level
+/// asked for, big or not. `None` leaves the caller to make a copy.
+///
+/// What the title places in these blocks are buffers of the card's (7 to 20
+/// MB each in the opening cutscene); the biggest is written by shaders only,
+/// and all of it was fetched back to the PC's memory every frame, 21 MB,
+/// where nothing read it. In place the card writes the memory the title has,
+/// and nothing is tracked, sent up, compared or fetched for it.
+///
+/// What it assumes, as renderer port 1 does: a step of ours on the CPU that
+/// reads this memory at a submission reads what is there, not what a
+/// submission still in the air will write.
+///
+/// Measured, and worse: run i1-inplace (RX 7700 XT, Series S profile,
+/// 2026-11-26) 21 fps against 29 to 30, the card waited for 13 to 15 ms a
+/// frame against 0 to 1. A heap opened on the PC's memory is the PC's memory:
+/// shaders that write 20 MB a frame there, and those that read it back, do
+/// it over the bus. What only shaders touch belongs in the card's memory;
+/// what is left to take out for it is the fetching back (21 MB a frame for
+/// that buffer), which needs to know that nothing on the CPU reads it.
+pub(crate) fn place_block(start: u64, len: u64) -> Option<Placed> {
+    if !blocks_in_place() {
+        return None;
+    }
+    {
+        let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let (&at, &bytes) = blocks.range(..=start as usize).next_back()?;
+        if start + len > (at + bytes) as u64 {
+            return None;
+        }
+    }
+    let host = crate::host::host()?;
+    match place_part(&host.device, start, len) {
+        Ok(placed) => {
+            counted(false, len);
+            tracing::info!(start = format_args!("{start:#x}"), len, "a title buffer in a block of its general allocator is in place: the card reads and writes the title's own memory (VICTORY_ALLOC_INPLACE=1)");
+            Some(placed)
+        }
+        Err(e) => {
+            tracing::warn!(start = format_args!("{start:#x}"), len, error = ?e.map(|e| e.to_string()), "a title buffer in a block of its general allocator not opened in place: a copy instead");
+            None
+        }
+    }
+}
+
 /// Something placed elsewhere (`crate::port`) in the same form: counted as
 /// [`place_for`] counts, so that [`gone`] takes it off again.
 pub(crate) fn counted(window: bool, bytes: u64) {
