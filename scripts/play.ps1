@@ -29,6 +29,16 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($Console -eq 'series-s') {
+    # Every title buffer's copy from 64 KiB up in the card's memory (at most
+    # 1 GiB of them), so that the card, not the CPU, finds what shaders wrote
+    # there. RX 7700 XT, opening cutscene, three runs against two: 17.0-18.0 fps
+    # -> 21.3, 16.8 (one run with slow stretches) and 20.5; copying back 30 -> 20
+    # ms a frame, preparing 47-49 -> 38-45, the card working 45 -> 32 ms. The
+    # card's memory then stands at 9.2-9.7 of a 10.2 GB budget, which Series X
+    # (already over its budget) has no room for.
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1024'
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
