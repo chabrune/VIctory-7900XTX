@@ -2040,7 +2040,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = scratch_on_card(host, size).or_else(|| host.upload_buffer(size))?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
@@ -2048,6 +2048,46 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         buffer,
         data: data as usize,
     })
+}
+
+/// Whether lists' scratch chunks are made in card memory the CPU maps
+/// (`D3D12_HEAP_TYPE_GPU_UPLOAD`; `VICTORY_SCRATCH_CARD=1`, off by default)
+/// while nine tenths of the card's budget are not in use: what draws read of
+/// them (constant buffers that are not in place, vertices and arguments of
+/// ours) they read in the card's memory and not over the bus. Upload memory is
+/// the PC's: a captured frame of the opening cutscene took 25.6 ms of an RX
+/// 7700 XT with its 160 MB of scratch in the card's memory against 26.3
+/// (`victory replay --buffers vram --only-buffers "name=list scratch"`), and
+/// with the tables' constant buffers copied there (`VICTORY_PORT_CBV_PLACE=0`)
+/// 25.2 against 26.4. The CPU only writes scratch memory (a read of such a
+/// mapping crosses the bus a few bytes at a time).
+fn scratch_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_CARD").is_some_and(|v| v == "1"))
+}
+
+/// Chunks of scratch made in the card's memory and in upload memory, since
+/// the start.
+static SCRATCH_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A scratch chunk in card memory the CPU maps, if they are to be there
+/// ([`scratch_card`]) and there is room.
+fn scratch_on_card(host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !scratch_card() {
+        return None;
+    }
+    let made = match host.video_memory() {
+        Some([budget, used, ..]) if used + size > budget / 10 * 9 => None,
+        _ => host.mapped_card_buffer(size, false),
+    };
+    let n = SCRATCH_MADE[usize::from(made.is_none())].fetch_add(1, Ordering::Relaxed) + 1;
+    if made.is_none() && (n == 1 || n.is_multiple_of(256)) {
+        tracing::info!(
+            "lists' scratch chunks (VICTORY_SCRATCH_CARD=1): {n} made in upload memory so far for want of room in the card's (or of such memory), {} in the card's",
+            SCRATCH_MADE[0].load(Ordering::Relaxed)
+        );
+    }
+    made
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -4672,6 +4712,10 @@ impl Host {
                     continue;
                 };
                 let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                #[cfg(feature = "diagnostics")]
+                if compared {
+                    owner::compared(shadow, span.pieces);
+                }
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
@@ -4691,6 +4735,8 @@ impl Host {
                 && twin
                 && u64::from(at + span.pieces) * 4 <= work.differs.2
             {
+                #[cfg(feature = "diagnostics")]
+                owner::compared(shadow, span.pieces);
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (*from, from + len),

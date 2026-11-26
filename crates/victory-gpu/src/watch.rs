@@ -1927,14 +1927,56 @@ pub(crate) fn card_primary(block: usize) -> usize {
 pub(crate) fn card_take(block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
     let views: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|at| at / BLOCK).collect();
-    let mut g = guards();
+    let g = guards();
     let why = if !g.protected.contains(block) {
+        // (Why not: it rests after a write, is left alone, is not a view's,
+        // or was never asked about.)
+        let fine = if g.rests(block, rest()) {
+            0
+        } else if g.left_alone(block) {
+            1
+        } else if g.foreign.contains(&block) {
+            2
+        } else if g.absent.contains(block) {
+            3
+        } else {
+            4
+        };
+        CARD_WHY[fine].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CARD_VIEWS_OF[views_bucket(views.len())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 4 || n.is_multiple_of(97) && n < 700 {
+                let shown: Vec<String> = views
+                    .iter()
+                    .map(|&v| format!("{:#x}{}{}", v * BLOCK, if g.protected.contains(v) { " guarded" } else { "" }, if g.clean.contains(v) { " clean" } else { "" }))
+                    .collect();
+                tracing::info!(
+                    "a block not taken for the card, not read-only: {:#x} (known a view: {}, in the fast set: {}), shown at {}",
+                    block * BLOCK,
+                    VIEWS.any(block, block + 1),
+                    PROTECTED.any(block, block + 1),
+                    shown.join(", ")
+                );
+            }
+        }
         Some(0)
     } else if !g.clean.contains(block) {
         Some(1)
     } else if g.left_alone(block) || views.iter().any(|&v| BESIDE.any(v, v + 1) || g.left_alone(v)) {
         Some(3)
     } else if views.is_empty() || views.len() > 8 || !views.contains(&block) {
+        CARD_WHY[if views.is_empty() { 5 } else if views.len() > 8 { 6 } else { 7 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CARD_VIEWS_OF[8 + views_bucket(views.len())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 4 || n.is_multiple_of(97) && n < 700 {
+                let shown: Vec<String> = views.iter().map(|v| format!("{:#x}", v * BLOCK)).collect();
+                tracing::info!("a block not taken for the card for its many views: {:#x}, shown at {}", block * BLOCK, shown.join(" "));
+            }
+        }
         Some(4)
     } else {
         None
@@ -1990,6 +2032,29 @@ pub(crate) fn card_take(block: usize) -> bool {
     }
     true
 }
+
+/// Diagnostics: the blocks not taken by how many addresses show their pages
+/// (0, 1, 2-8, 9-16, 17-64, 65-256, 257-1024, more): those not read-only,
+/// then those of many views.
+pub(crate) static CARD_VIEWS_OF: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+fn views_bucket(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1 => 1,
+        2..=8 => 2,
+        9..=16 => 3,
+        17..=64 => 4,
+        65..=256 => 5,
+        257..=1024 => 6,
+        _ => 7,
+    }
+}
+
+/// Diagnostics, finer than [`CARD_REFUSED`]: not read-only because the block
+/// rests after a write, is left alone, is not a view's, is absent, other; no
+/// view of its pages known, more than eight, its own not among them.
+pub(crate) static CARD_WHY: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// Why blocks were not taken for the card, since the start: not read-only by
 /// the guards' hand, not clean, read-only together with other views, left

@@ -93,6 +93,11 @@ const BLOCK: usize = 64 << 10;
 /// faulting thread's stack (who called the copy).
 static OPENERS: Mutex<Vec<(u64, u64, usize, u8, bool, u32, [usize; 5])>> = Mutex::new(Vec::new());
 
+/// Diagnostics: blocks brought down for a read of ours, by the copy that was
+/// being refreshed (start, length; 0: not known) and the copy whose block it
+/// was (start): how many, the reader's kind, the owner's length.
+static READERS: Mutex<BTreeMap<(u64, u64, u64), (u64, u8, u64)>> = Mutex::new(BTreeMap::new());
+
 /// Who touched a copy: the instruction, read or write, whether in a copy of
 /// ours, and where the thread's stack was.
 type Who = (usize, u8, bool, usize);
@@ -498,10 +503,33 @@ pub(super) fn claim_blocks(host: &Host, shadow: &Arc<Shadow>, ranges: &[(usize, 
     while shadow.readers() != 0 && waiting.elapsed().as_millis() < 200 {
         std::thread::yield_now();
     }
+    #[cfg(feature = "diagnostics")]
+    let refused_before: Vec<u64> = crate::watch::CARD_REFUSED.iter().map(|r| r.load(Relaxed)).collect();
     let mut taken = 0;
     if shadow.readers() == 0 {
         for &block in &ready {
             taken += u32::from(crate::watch::card_take(block));
+        }
+    }
+    // Diagnostics: the first askings that took less than they asked for.
+    #[cfg(feature = "diagnostics")]
+    {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if (taken as usize) < blocks.len() && SAID.fetch_add(1, Relaxed) < 80 {
+            let refused: Vec<u64> = crate::watch::CARD_REFUSED.iter().zip(&refused_before).map(|(r, b)| r.load(Relaxed) - b).collect();
+            let (start, len) = shadow.span();
+            tracing::info!(
+                "blocks asked for the card of {start:#x}+{len:#x}: {} asked, {} up to date, {taken} taken (readers {}); refused now: {} not read-only by the guards' hand, {} not clean, {} with a view that could not be closed, {} left alone, {} shown at more than eight addresses or none; first block {:#x}",
+                blocks.len(),
+                ready.len(),
+                shadow.readers(),
+                refused[0],
+                refused[1],
+                refused[2],
+                refused[3],
+                refused[4],
+                blocks[0] * BLOCK
+            );
         }
     }
     if taken > 0 {
@@ -586,6 +614,14 @@ fn open_block(shadow: &Shadow, at: usize, who: Option<Who>) -> bool {
         let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         openers.push((address as u64, BLOCK as u64, site, kind, ours, thread, if ours { callers(stack) } else { [0; 5] }));
     }
+    // Diagnostics: by the copy whose refresh read the block (a copy of ours).
+    if ours {
+        let reader = crate::shadow::reader_now().unwrap_or((0, 0, 0));
+        let (cs, cl) = shadow.span();
+        let mut by = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.entry((reader.0, reader.1, cs)).or_insert((0, reader.2, cl));
+        e.0 += 1;
+    }
     true
 }
 
@@ -632,6 +668,27 @@ pub(crate) fn forgetting(at: usize, len: usize) {
     }
 }
 
+/// Diagnostics: the copies a compare was planned for since the last line,
+/// by the copy: what it is to the owner, the pieces compared and in how
+/// many ranges.
+#[cfg(feature = "diagnostics")]
+static COMPARED: Mutex<BTreeMap<usize, (String, u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Diagnostics: a compare of `pieces` pieces of `shadow` was planned.
+#[cfg(feature = "diagnostics")]
+pub(super) fn compared(shadow: &Arc<Shadow>, pieces: u32) {
+    if !on() {
+        return;
+    }
+    let mut all = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = all.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (String::new(), 0, 0));
+    if entry.2 == 0 {
+        entry.0 = shadow.owner_says();
+    }
+    entry.1 += u64::from(pieces);
+    entry.2 += 1;
+}
+
 /// A landing left `pieces` pieces of 64 KiB on the card: in blocks that are
 /// the card's alone.
 pub(super) fn left(pieces: u64) {
@@ -642,6 +699,31 @@ pub(super) fn left(pieces: u64) {
 pub(super) fn line() {
     if !on() {
         return;
+    }
+    {
+        let why: Vec<u64> = crate::watch::CARD_WHY.iter().map(|w| w.load(Relaxed)).collect();
+        tracing::info!(
+            "blocks not taken for the card, since the start, finer: not read-only: {} resting after a write, {} left alone, {} not a view's, {} absent, {} others; views of the pages: {} none known, {} more than eight, {} its own not among them",
+            why[0], why[1], why[2], why[3], why[4], why[5], why[6], why[7]
+        );
+        let views: Vec<u64> = crate::watch::CARD_VIEWS_OF.iter().map(|w| w.load(Relaxed)).collect();
+        tracing::info!(
+            "blocks not taken for the card by how many addresses show their pages (0, 1, 2-8, 9-16, 17-64, 65-256, 257-1024, more): not read-only {:?}; many views {:?}",
+            &views[..8],
+            &views[8..]
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut all: Vec<(String, u64, u64)> = std::mem::take(&mut *COMPARED.lock().unwrap_or_else(|e| e.into_inner())).into_values().collect();
+        all.sort_by_key(|c| std::cmp::Reverse(c.1));
+        let pieces: u64 = all.iter().map(|c| c.1).sum();
+        let lines: Vec<String> = all.iter().take(14).map(|(what, pieces, ranges)| format!("{pieces} pieces in {ranges} ranges of {what}")).collect();
+        tracing::info!(
+            "copies still compared on the card since the last line (VICTORY_CARD_OWNED=1): {pieces} pieces of {} copies; the most: {}",
+            all.len(),
+            lines.join("; ")
+        );
     }
     tracing::info!(
         "blocks of 64 KiB of view memory that are the card's alone (VICTORY_CARD_OWNED=1): since the start {} asked about, {} of them up to date, {} taken, {} brought down again; {} pieces left on the card and not fetched; not taken: {} not read-only by the guards' hand, {} not clean, {} with a view that could not be closed, {} left alone, {} shown at more than eight addresses or none",
@@ -690,6 +772,27 @@ pub(super) fn line() {
             )
         })
         .collect();
+    {
+        let by = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all: Vec<_> = by.iter().collect();
+        all.sort_by_key(|(_, v)| std::cmp::Reverse(v.0));
+        let lines: Vec<String> = all
+            .iter()
+            .take(16)
+            .map(|((rs, rl, os), (n, kind, ol))| {
+                format!(
+                    "{n} blocks of {os:#x}+{ol:#x} for the refresh of {rs:#x}+{rl:#x}{}{}",
+                    if kind & 1 != 0 { " (a window)" } else { "" },
+                    if kind & 2 != 0 { " (on the card)" } else { "" }
+                )
+            })
+            .collect();
+        tracing::info!(
+            "blocks that were the card's alone brought down for reads of ours, since the start, by the copy refreshed: {} pairs; {}",
+            all.len(),
+            lines.join("; ")
+        );
+    }
     tracing::info!(
         "copies that are the card's alone (VICTORY_CARD_OWNED=1): {} now, {} MB; since the start {} taken, {} turned down, {} opened by the title, {} by code of ours or let go; the first opened: {}",
         COUNT.load(Relaxed),

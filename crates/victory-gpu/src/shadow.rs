@@ -2719,6 +2719,16 @@ struct Reading<'a>(&'a Shadow);
 thread_local! {
     /// How many reads of title memory ([`Shadow::reading`]) the thread is in.
     static READING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Diagnostics: the copy the thread last began to read title memory for
+    /// (start, length, kind: 1 a window, 2 with a side on the card).
+    static READER: std::cell::Cell<(u64, u64, u8)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Diagnostics: the copy this thread last began to read title memory for, if
+/// it is in such a read now: what a fault in a block that is the card's alone
+/// is blamed on (`crate::host::owner`).
+pub(crate) fn reader_now() -> Option<(u64, u64, u8)> {
+    (READING.get() != 0).then(|| READER.get())
 }
 
 impl Drop for Reading<'_> {
@@ -3250,6 +3260,7 @@ impl Shadow {
             // is done, unless this is a read inside a read that began before.
             if !self.sealing.load(Ordering::SeqCst) || READING.get() != 0 {
                 READING.set(READING.get() + 1);
+                READER.set((self.start, self.len, u8::from(self.window) | u8::from(self.card.is_some()) << 1));
                 return Some(Reading(self));
             }
             self.readers.fetch_sub(1, Ordering::SeqCst);
@@ -3341,6 +3352,33 @@ impl Shadow {
     /// Whether any is.
     pub(crate) fn has_card_blocks(&self) -> bool {
         self.owned_blocks.load(Ordering::Relaxed) != 0
+    }
+
+    /// Diagnostics: what the copy is to the owner, for the census of what is
+    /// still compared (`crate::host::owner::compared`): where it lies, how
+    /// its memory is watched, and how far the card owns it.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn owner_says(&self) -> String {
+        let asked = self.asked_blocks.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
+        format!(
+            "{:#x}+{:#x}{}{}{}{}, memory {}, owner state {}{}, {} blocks asked about, {} the card's",
+            self.start,
+            self.len,
+            if self.card.is_some() { "" } else { ", no card side" },
+            if self.place.is_some() { ", in place" } else { "" },
+            if self.window { ", a window" } else { "" },
+            if self.mapped { ", mapped" } else { "" },
+            match self.watched.load(Ordering::Relaxed) {
+                1 => "watched by the kernel",
+                NOT_WATCHED => "not watched",
+                GUARDED => "guarded",
+                _ => "not looked at yet",
+            },
+            self.owned.load(Ordering::Relaxed),
+            if self.owner_asked.load(Ordering::Relaxed) { " (asked)" } else { "" },
+            asked,
+            self.owned_blocks.load(Ordering::Relaxed)
+        )
     }
 
     /// Whether offsets `[lo, hi)` of the copy lie in blocks that are the
@@ -5533,6 +5571,112 @@ pub(crate) fn overlaps_line() {
         all.len(),
         with_written >> 20,
         shared >> 20,
+        told.join("; ")
+    );
+    physical_line();
+}
+
+/// Diagnostics, with [`overlaps_line`]: the same by the pages themselves. The
+/// title shows a page of its memory at several addresses, and has buffers at
+/// each: a copy for every one of them holds the page's bytes, on the card
+/// too. Said: how many 64 KiB pages lie in how many copies, how many of those
+/// copies were asked for within the last frames, and the pages most copies
+/// hold with the copies.
+#[cfg(feature = "diagnostics")]
+fn physical_line() {
+    const K64: u64 = 64 << 10;
+    // A copy: start, end, shaders write it, a window, on the card, frames
+    // since it was last asked for.
+    let frame = crate::frame::current();
+    let mut all: Vec<(u64, u64, bool, bool, bool, u64)> = Vec::new();
+    let ago = |shadow: &Shadow| frame.saturating_sub(shadow.used.load(Ordering::Relaxed) >> 32);
+    for (key, entry) in buffers_read().iter() {
+        if let Some(shadow) = &entry.shadow {
+            all.push((key.0, entry.end, shadow.written(), false, shadow.card.is_some(), ago(shadow)));
+        }
+    }
+    for (key, shadow) in LOOSE.read().unwrap_or_else(|e| e.into_inner()).iter() {
+        all.push((key.0, key.0 + key.1, shadow.written(), true, shadow.card.is_some(), ago(shadow)));
+    }
+    // The page of the section each 64 KiB page of a copy shows, and the
+    // copies that show it.
+    let mut by_page: std::collections::HashMap<(usize, u64), Vec<u32>> = std::collections::HashMap::new();
+    let mut views = 0u64;
+    for (i, copy) in all.iter().enumerate() {
+        let mut at = copy.0 - copy.0 % K64;
+        while at < copy.1 {
+            if let Some((section, offset)) = crate::inplace::section_of(at as usize) {
+                by_page.entry((section, offset - offset % K64)).or_default().push(i as u32);
+                views += 1;
+            }
+            at += K64;
+        }
+    }
+    // By how many copies hold a page (1, 2, 3-4, 5-8, 9-16, more), the
+    // pages; then by how many of them were asked for in the last four
+    // frames (0, 1, 2, 3-4, more), the pages more than one copy holds.
+    let mut held = [0u64; 6];
+    let mut live = [0u64; 5];
+    let (mut live_written, mut twice) = (0u64, 0u64);
+    let mut most: Vec<(usize, (usize, u64))> = Vec::new();
+    for (page, copies) in &by_page {
+        let n = copies.len();
+        held[match n {
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            _ => 5,
+        }] += 1;
+        if n < 2 {
+            continue;
+        }
+        twice += 1;
+        let now: Vec<&u32> = copies.iter().filter(|&&c| all[c as usize].5 <= 4).collect();
+        live[match now.len() {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3..=4 => 3,
+            _ => 4,
+        }] += 1;
+        if now.len() >= 2 && now.iter().any(|&&c| all[c as usize].2) {
+            live_written += 1;
+        }
+        most.push((n, *page));
+    }
+    most.sort_unstable_by(|a, b| b.cmp(a));
+    let kind = |c: &(u64, u64, bool, bool, bool, u64)| {
+        format!(
+            "{:#x}+{:#x} ({}{}{}, asked for {} frames ago)",
+            c.0,
+            c.1 - c.0,
+            if c.3 { "window" } else { "buffer" },
+            if c.2 { ", shaders write it" } else { "" },
+            if c.4 { ", on the card" } else { "" },
+            c.5
+        )
+    };
+    // Three pages: the one most copies hold, and two further down.
+    let told: Vec<String> = [0, most.len() / 3, most.len() * 2 / 3]
+        .iter()
+        .filter_map(|&k| most.get(k))
+        .map(|(n, page)| {
+            let copies: Vec<String> = by_page[page].iter().map(|&c| kind(&all[c as usize])).collect();
+            format!("the page at {:#x} of section {:#x} in {n} copies: {}", page.1, page.0, copies.join(", "))
+        })
+        .collect();
+    tracing::info!(
+        "host copies by the pages of title memory they show: {} pages of 64 KiB in view memory shown by {} copies' pages ({} MB against {} MB); pages by how many copies hold them (1, 2, 3-4, 5-8, 9-16, more): {:?}; of the {} pages more than one copy holds, by how many of the copies were asked for in the last four frames (0, 1, 2, 3-4, more): {:?}, {} of them with two or more such copies and shaders writing one; {}",
+        by_page.len(),
+        views,
+        by_page.len() as u64 * K64 >> 20,
+        views * K64 >> 20,
+        held,
+        twice,
+        live,
+        live_written,
         told.join("; ")
     );
 }
