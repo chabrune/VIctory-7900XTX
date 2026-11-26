@@ -1250,6 +1250,9 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // (Private memory left to the guards, [`quiet`]: they see every write
+    // of it, so they answer whoever asks.)
+    let guarded = guarded || QUIET.all(first, last);
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
@@ -1287,6 +1290,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return Some(known);
     }
     let mut guards_asked = false;
+    // The blocks the guards told as written, which they made clean again.
+    let mut told: Vec<usize> = Vec::new();
     // (View memory read-only by our hand: the kernel would refuse. With
     // renderer port #6 also view memory known as such, [`VIEWS`].)
     let protected = guarded && light() && PROTECTED.any(first, last);
@@ -1304,7 +1309,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let mut written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let mut written = guard(first * PAGE, last * PAGE).map(|blocks| {
+                let parts = quiet_parts(&blocks);
+                told = blocks;
+                parts
+            });
             if written.is_none() && viewed {
                 // Not a view after all (other memory there now): forgotten as
                 // one, and the kernel asked as before.
@@ -1329,6 +1338,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
     };
     if pages.is_empty() {
+        // (Blocks of private memory the guards made clean and the kernel
+        // found unwritten: known by their bits from now on, as below.)
+        if guards_asked && light() && !told.is_empty() {
+            publish(&told);
+        }
         // Nothing to note: the others may go on reading.
         return Some(fresh());
     }
@@ -1355,7 +1369,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // now on. (The range is still held: no other asking of any of it came
     // between.)
     if guards_asked && light() {
-        publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
+        publish(&told);
     }
     Some(answer)
 }
@@ -1633,6 +1647,19 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_RESTED_HOT],
         n[P6_NOT_ASKED],
     );
+    use std::sync::atomic::Ordering::Relaxed;
+    let q: Vec<u64> = QUIET_COUNTS.iter().enumerate().map(|(i, c)| if i < 3 { c.swap(0, Relaxed) } else { c.load(Relaxed) }).collect();
+    if q[3] != 0 {
+        tracing::info!(
+            "private title memory left to the guards (VICTORY_QUIET_GUARD=1): {} ranges, {} MB, since the start; per frame {:.1} kernel askings \
+             for {:.1} blocks the guards found written, {:.1} pages of 4 KiB written in them",
+            q[3],
+            (q[4] * BLOCK as u64) >> 20,
+            q[0] as f64 / frames,
+            q[1] as f64 / frames,
+            q[2] as f64 / frames,
+        );
+    }
 }
 
 /// The blocks known to be view memory (renderer port #6): guarded by us
@@ -1642,6 +1669,143 @@ pub(crate) fn port_guard_line(frames: f64) {
 /// or freed; a block wrongly here is only looked at by the guards, which
 /// find it no view ([`is_view`]) and say the range is not watched.
 static VIEWS: Bits = Bits::new();
+
+/// Blocks of private title memory that are left to the guards ([`quiet`]),
+/// as view memory is.
+static QUIET: Bits = Bits::new();
+
+/// Since the last frame line, for [`QUIET`] memory: kernel askings made for
+/// the blocks the guards found written, those blocks, and the 4 KiB pages
+/// the kernel named in them; since the start: ranges left to the guards and
+/// their blocks.
+static QUIET_COUNTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(test)]
+thread_local! {
+    /// [`quiet_on`], for what this thread asks.
+    static QUIET_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether large ranges of private title memory that are refreshed whole
+/// are left to the guards (`VICTORY_QUIET_GUARD=1`, with renderer port #6
+/// and the light refreshes; off by default).
+///
+/// Private memory is write-watched by the kernel, and an asking walks the
+/// page tables of all it asks about. The title's pool-wide buffers over its
+/// 64 MiB chunks are refreshed whole by every list that comes to memory by
+/// address (`crate::memory`): with ray tracing some twenty of them by each
+/// of the four submissions a frame that trace or build, 4.9 GB of page
+/// tables walked a frame to hear that a handful of pages were written
+/// (run rt-trace3: 618 askings over 6,724 MB in 8.9 ms a frame against 229
+/// over 1,485 MB in 2.9 without ray tracing, all on the submitting thread's
+/// way), and as many megabytes looked at by the refreshes.
+fn quiet_on() -> bool {
+    #[cfg(test)]
+    if QUIET_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUIET_GUARD").is_some_and(|v| v == "1")) && port_guard() && light()
+}
+
+/// Leaves the private title memory `[start, end)` to the guards from now
+/// on ([`quiet_on`]): its blocks are made read-only at its next asking and
+/// known unwritten by their bits after, with no word of the kernel's; a
+/// write of the title's faults once a block, as in view memory. Nothing is
+/// told less exactly than before: of the blocks the guards find written
+/// the kernel is asked, them alone, which 4 KiB pages were
+/// ([`quiet_parts`]), and so at the first asking of all of the range.
+///
+/// For memory the title writes little: every write there costs a fault and
+/// two changes of a block's protection. What the runtime commits over such
+/// blocks is opened ([`title_memory_allocated`]); what it frees is
+/// forgotten ([`forget_views`]). The card's owner takes no block of it
+/// ([`card_take`] wants a view of the page).
+pub(crate) fn quiet(start: usize, end: usize) {
+    if start >= end || !quiet_on() {
+        return;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if QUIET.all(first, last) || VIEWS.any(first, last) || PROTECTED.any(first, last) || is_view(start, end) {
+        return;
+    }
+    // (Held: no asking of any of it is under way while the bits change, so
+    // the kernel's answer and the guards' are never mixed in one asking.)
+    let _range = Asking::hold(first, last);
+    // The kernel must know the memory, or nothing could say what was
+    // written before the guards had it. Its answer is noted as any
+    // asking's.
+    let Some(pages) = kernel_written(first, last) else {
+        return;
+    };
+    if !pages.is_empty() {
+        note_shared(&pages);
+    }
+    (first..last).for_each(|block| QUIET.set(block));
+    (first..last).for_each(|block| VIEWS.set(block));
+    QUIET_COUNTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    QUIET_COUNTS[4].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
+        tracing::info!(
+            "private title memory left to the guards (VICTORY_QUIET_GUARD=1): {start:#x}+{:#x}, {} blocks of 64 KiB",
+            end - start,
+            last - first
+        );
+    }
+}
+
+/// What was written of `blocks`, which the guards found not clean (in
+/// order): all of each, but of a block of [`QUIET`] memory the parts the
+/// kernel says were written since it was last asked, which may be none (a
+/// block that rests after a write, or that only just came to the guards).
+/// The caller holds the range ([`Asking`]).
+fn quiet_parts(blocks: &[usize]) -> Vec<(usize, u16)> {
+    let (Some(&lowest), Some(&highest)) = (blocks.first(), blocks.last()) else {
+        return Vec::new();
+    };
+    if !QUIET.any(lowest, highest + 1) {
+        return blocks.iter().map(|&block| (block, WHOLE)).collect();
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut parts = Vec::with_capacity(blocks.len());
+    let mut i = 0;
+    while i < blocks.len() {
+        let block = blocks[i];
+        if !QUIET.any(block, block + 1) {
+            parts.push((block, WHOLE));
+            i += 1;
+            continue;
+        }
+        // A run of them: one asking.
+        let mut k = i + 1;
+        while k < blocks.len() && blocks[k] == blocks[k - 1] + 1 && QUIET.any(blocks[k], blocks[k] + 1) {
+            k += 1;
+        }
+        let before = parts.len();
+        QUIET_COUNTS[1].fetch_add((k - i) as u64, Relaxed);
+        match kernel_written(block, blocks[k - 1] + 1) {
+            Some(pages) => {
+                QUIET_COUNTS[0].fetch_add(1, Relaxed);
+                parts.extend(pages);
+            }
+            // (Two reservations, or memory the kernel does not watch after
+            // all: block by block, and whole where it will not say.)
+            None => {
+                for &block in &blocks[i..k] {
+                    QUIET_COUNTS[0].fetch_add(1, Relaxed);
+                    match kernel_written(block, block + 1) {
+                        Some(pages) => parts.extend(pages),
+                        None => parts.push((block, WHOLE)),
+                    }
+                }
+            }
+        }
+        QUIET_COUNTS[2].fetch_add(parts[before..].iter().map(|p| u64::from(p.1.count_ones())).sum(), Relaxed);
+        i = k;
+    }
+    parts
+}
 
 /// Whether a block of `[first, last)` is known view memory and the kernel
 /// need not be asked ([`VIEWS`]).
@@ -2351,6 +2515,13 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    // Committed over blocks that are read-only by our hand (private memory,
+    // [`quiet`]: a commit gives the pages the protection it names, and a
+    // write after it would not fault): opened, and told as written.
+    if len != 0 && QUIET.any(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)) {
+        let g = guards();
+        open(&g, at, at.saturating_add(len));
+    }
     if len == 0 || !known_holes() {
         return;
     }
@@ -2977,7 +3148,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             let of = |g: &Guards| g.protected.contains(first) || g.absent.contains(first);
             if port_guard() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
         });
-    if !known && !is_view(start, end) {
+    if !known && !is_view(start, end) && !QUIET.any(first, last) {
         return None;
     }
     install();
@@ -3017,7 +3188,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if block >= uncommitted_until {
             // The hole may have been given up, and its address be the
             // title's heap's, or code's, now: not ours to guard.
-            came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+            came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK) || QUIET.any(block, block + 1)));
         }
     }
     let rest = rest();
@@ -3997,6 +4168,14 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// What is known of `[first, last)` as view memory ([`VIEWS`]) is forgotten.
 fn forget_views(first: usize, last: usize) {
+    // (And what was left to the guards of private memory, [`quiet`]: the
+    // address may be other memory's next.)
+    if QUIET.any(first, last) {
+        let set: Vec<usize> = QUIET.set_in(first, last).collect();
+        for block in set {
+            QUIET.clear(block);
+        }
+    }
     if !VIEWS.any(first, last) {
         return;
     }
@@ -5283,6 +5462,77 @@ mod tests {
         assert_eq!(tracked.take(p, p + 4 * PAGE), [(p + 2 * PAGE, p + 2 * PAGE + 4096), (p + 2 * PAGE + 8192, p + 2 * PAGE + 12288)]);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Private memory left to the guards ([`quiet`]) tells what the kernel's
+    /// own asking would: the 4 KiB pages written, no more. Its blocks are
+    /// read-only, and nothing is asked of the kernel while none is written.
+    #[test]
+    fn quiet_memory_tells_what_the_kernel_would() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PORT_GUARD_IN_TEST.set(true);
+        QUIET_IN_TEST.set(true);
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let write = |at: usize| {
+            // SAFETY: committed pages of ours; read-only ones fault into the
+            // guards' handler, which opens their block.
+            unsafe { ((p + at) as *mut u8).write_volatile(1) }
+        };
+        let blocks = (p / BLOCK, p / BLOCK + 4);
+        let tracked = track(p, 4 * PAGE, true).expect("watched");
+        // (Other tests' memory was here.)
+        (0..4).for_each(|page| write(page * PAGE + 5));
+        quiet(p, p + 4 * PAGE);
+        assert!(QUIET.all(blocks.0, blocks.1));
+        // What was written before the guards had it is not lost.
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)], "never taken");
+        assert!((0..4).all(|block| !writable(p + block * PAGE)), "read-only by the guards' hand");
+        assert!(published(p, p + 4 * PAGE));
+        // Nothing written: the bits say so, and the kernel is not asked.
+        let asked = QUIET_COUNTS[0].load(Relaxed);
+        assert!(tracked.take(p, p + 4 * PAGE).is_empty());
+        assert!(tracked.take(p + PAGE, p + 2 * PAGE).is_empty());
+        assert_eq!(QUIET_COUNTS[0].load(Relaxed), asked);
+        // Writes fault, are made, and are told by their 4 KiB pages.
+        write(PAGE + 5000);
+        write(PAGE + 8192);
+        write(PAGE + 65535);
+        write(2 * PAGE);
+        assert!(!published(p, p + 4 * PAGE));
+        assert!(writable(p + PAGE) && writable(p + 2 * PAGE) && !writable(p) && !writable(p + 3 * PAGE));
+        assert_eq!(
+            tracked.take(p, p + 4 * PAGE),
+            [(p + PAGE + 4096, p + PAGE + 3 * 4096), (p + 2 * PAGE - 4096, p + 2 * PAGE + 4096)]
+        );
+        // (One asking of the kernel's, for the two blocks.)
+        assert_eq!(QUIET_COUNTS[0].load(Relaxed), asked + 1);
+        // Made clean again by that asking.
+        assert!(!writable(p + PAGE) && !writable(p + 2 * PAGE));
+        assert!(published(p, p + 4 * PAGE));
+        write(2 * PAGE + 70);
+        // An asking that leaves the guards out (a texture's) is answered by
+        // them all the same, and two askings' writes are in what is taken
+        // after both.
+        assert!(writes(p, p + 4 * PAGE, false).is_some());
+        write(2 * PAGE + 9000);
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p + 2 * PAGE, p + 2 * PAGE + 4096), (p + 2 * PAGE + 8192, p + 2 * PAGE + 12288)]);
+        // Committed over: opened, and nothing told that was not written.
+        title_memory_allocated(p + 3 * PAGE, PAGE);
+        assert!(writable(p + 3 * PAGE) && !published(p, p + 4 * PAGE));
+        assert!(tracked.take(p, p + 4 * PAGE).is_empty());
+        assert!(!writable(p + 3 * PAGE));
+        // Freed: forgotten, and as it was.
+        title_memory_freed(p, 4 * PAGE);
+        assert!(!QUIET.any(blocks.0, blocks.1) && !VIEWS.any(blocks.0, blocks.1));
+        assert!((0..4).all(|block| writable(p + block * PAGE)));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        PORT_GUARD_IN_TEST.set(false);
+        QUIET_IN_TEST.set(false);
     }
 
     /// The frames pages were last landed in.

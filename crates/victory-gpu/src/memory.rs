@@ -101,6 +101,9 @@ const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
 /// The biggest title buffer whose builder results come back.
 const BACK: u64 = 256 << 10;
+/// A title buffer of so many bytes or more that holds pages is left to the
+/// guards (`crate::watch::quiet`).
+const QUIET: u64 = 4 << 20;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
 /// pages there are in the first seconds (run light-4).
@@ -341,6 +344,14 @@ impl Memory {
             // copy of its own is given this copy too.
             if fresh {
                 let (first, len) = shadow.span();
+                // A title buffer over megabytes of the title's pools, which
+                // every list that comes here refreshes whole from now on:
+                // where it is private memory the guards say what was
+                // written of it, not an asking of the kernel's over all of
+                // it at every submission (`crate::watch::quiet`).
+                if len >= QUIET {
+                    crate::watch::quiet(first as usize, (first + len) as usize);
+                }
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     let entry = self.entry(at / PAGE);
