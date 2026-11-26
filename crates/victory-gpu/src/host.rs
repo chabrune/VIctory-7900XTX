@@ -3664,6 +3664,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 mod send;
+mod sender;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
@@ -5682,14 +5683,36 @@ impl Host {
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
+            let execute = |lists: Vec<Option<ID3D12CommandList>>, cuts: Vec<usize>| unsafe {
                 let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
+                for to in cuts.iter().copied().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            // On a thread of its own if that is asked for (`VICTORY_SUBMIT_TWO`):
+            // the submission lock is held until it has given the lists to the
+            // queue and signalled behind them, so the order and what the next
+            // preparation asks about are as they are here.
+            let mut sent_there: Option<windows::core::Result<()>> = None;
+            let mut sent_here: Option<windows::core::Result<()>> = None;
+            if sender::on() {
+                let batches = sender::Batches { lists, cuts, value: *submitted };
+                match sender::hand(batches) {
+                    Ok(Some(result)) => {
+                        sent_there = Some(result.map_err(|e| {
+                            windows::core::Error::new(windows::Win32::Foundation::E_FAIL, e)
+                        }));
+                    }
+                    Ok(None) => sent_there = Some(Ok(())),
+                    // (No thread to take them: sent here, as before.)
+                    Err(batches) => sent_here = Some(execute(batches.lists, batches.cuts)),
+                }
+            } else {
+                sent_here = Some(execute(lists, cuts));
+            }
+            let signalled = sent_there.or(sent_here).unwrap_or(Ok(()));
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);

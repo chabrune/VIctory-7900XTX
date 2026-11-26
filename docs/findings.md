@@ -216,6 +216,45 @@ slot.
 
 Not measured yet on the title: `VICTORY_TEXTURE_SHARDS=1` is the A/B of the same run.
 
+## What the translated shaders are made of (2026-11-26)
+
+The title's own containers are written down as it uses them:
+`VICTORY_SHADER_DUMP=<folder>` (a diagnostics build; the folder outside the
+repository) writes each one once as `<blake3>.cdxil`, the name a command's
+note starts with (`[compute <16 hex>]`). `victory translate <folder>` with
+`VICTORY_SHADER_CENSUS=<file>` then writes a line per emitted program: the
+console program's instructions by class and the host module's by kind
+(`emit::census::KINDS`). Two minutes of the opening dumped 19,127 containers,
+of which 721 translate.
+
+Those 721 are 1,289,934 console instructions and 3,148,778 host ones (2.44
+times). Of the host ones 382,415 are bitcasts, 200,883 extractions from a
+load's four components, 128,444 phis and 101,594 the blocks they live in —
+the driver folds the first two away — and 1,432,841 arithmetic operations
+for 915,094 console VALU instructions (1.56 each). The four biggest compute
+programs are 19,846 to 19,458 console instructions in 1,632 blocks each: the
+title's uber-shaders, most of their code cold on any one lane.
+
+**The largest single cost was the legacy product.** `v_mul_legacy_f32` is what
+the console's compiler writes for nearly every multiply (2,270 of the 19,846
+instructions of the biggest compute program). The console gives 0 where one
+factor is ±0, whatever the other is; no host instruction does, so the
+translator asks whether the smaller magnitude is zero (`fmin(|a|, |b|) == 0`)
+and selects a zero — three instructions where the console has one, on one in
+eleven of its instructions. Written as the plain product
+(`VICTORY_LEGACY_MUL=0`), the same 721 programs come to 2,567,789 host
+instructions, **18.5 % fewer**: compute 1,331,549 → 1,076,607 (19.1 %), pixel
+20.4 %, mesh 14.1 %, vertex 11.7 %; the biggest compute programs 17 to 21 %
+fewer, and half the selects (377,931 → 186,027) go with it. What differs: a
+product of a zero and an infinity or a NaN is that instead of a zero; every
+other pair of values gives the same bits (a zero's sign may differ). Off by
+default; part of the translation, so the shader cache keys on it.
+
+(Method note: `victory translate` without `--pipelines` makes no device, so
+`host_rdna()` is false and the census counts the forms spelled out for every
+host. A run takes the RDNA ones, where a legacy product is the `fmin`, a
+compare and a select; the three instructions are the same either way.)
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask
