@@ -4036,6 +4036,29 @@ impl Shadow {
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            // Said once for a copy of a megabyte and more: what the memory
+            // is, since every refresh of it from here on copies it whole.
+            #[cfg(feature = "diagnostics")]
+            if self.len >= 1 << 20 {
+                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                // SAFETY: zeroed is a valid value of it, and the call fills it.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a question about an address; the structure is ours.
+                unsafe { VirtualQuery(self.start as usize as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+                tracing::info!(
+                    "a copy of title memory that is neither write-watched nor guarded is copied whole at every refresh: {:#x}+{:#x}, in an allocation at {:#x}, region {:#x} bytes, state {:#x}, type {:#x}, protection {:#x} (at allocation {:#x}); asked for [{:#x}, {:#x})",
+                    self.start,
+                    self.len,
+                    info.AllocationBase as usize,
+                    info.RegionSize,
+                    info.State,
+                    info.Type,
+                    info.Protect,
+                    info.AllocationProtect,
+                    from,
+                    to
+                );
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
