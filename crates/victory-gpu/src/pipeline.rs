@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
@@ -100,9 +101,41 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// With `VICTORY_SHADER_DUMP=<folder>` (diagnostics): every console shader the
+/// title uses, once, as `<blake3>.cdxil` — the name the log knows it by (a
+/// command's note says `[compute <16 hex>]`, the start of that name). What the
+/// translator makes of them is then read offline: `victory translate <folder>
+/// --list` with `VICTORY_SHADER_CENSUS` set counts the instructions it emits
+/// for each. A folder inside the repository is refused: the shaders are the
+/// title's.
+#[cfg(feature = "diagnostics")]
+fn dump(full: &blake3::Hash, bytes: &[u8]) {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let dir = PathBuf::from(std::env::var_os("VICTORY_SHADER_DUMP")?);
+        if let Err(e) = victory_core::ensure_outside_repo(&dir) {
+            tracing::warn!(error = %e, "no shader dump");
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, folder = %dir.display(), "no shader dump folder");
+            return None;
+        }
+        tracing::info!(
+            folder = %dir.display(),
+            "console shaders are written down as the title uses them (VICTORY_SHADER_DUMP)"
+        );
+        Some(dir)
+    });
+    let Some(dir) = dir else { return };
+    let _ = std::fs::write(dir.join(format!("{}.cdxil", full.to_hex())), bytes);
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    #[cfg(feature = "diagnostics")]
+    dump(&full, bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)

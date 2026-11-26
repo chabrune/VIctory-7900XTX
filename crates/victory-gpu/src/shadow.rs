@@ -370,6 +370,21 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// Of the copies in the card's memory alive now: how many no shader was ever
+/// declared to write and their bytes, how many one was and their bytes; then
+/// the same of windows among them. (A copy nothing ever writes from the
+/// card's side needs no second side: the CPU could fill the card's.)
+pub(crate) fn card_written_census() -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for shadow in carded_copies() {
+        let Some(card) = &shadow.card else { continue };
+        let at = 2 * usize::from(shadow.written()) + 4 * usize::from(shadow.window);
+        out[at] += 1;
+        out[at + 1] += card.size;
+    }
+    out
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
