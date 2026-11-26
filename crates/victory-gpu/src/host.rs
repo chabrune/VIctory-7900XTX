@@ -73,7 +73,31 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+static RETIRED: [Mutex<std::collections::VecDeque<(u64, Retired)>>; RETIRING] =
+    [const { Mutex::new(std::collections::VecDeque::new()) }; RETIRING];
+
+/// The lines objects let go wait in ([`retire`]). There was one, under one
+/// lock, and what a descriptor slot showed goes into it 20,000 times a frame
+/// from the eight threads that translate lists, the thread that mirrors the
+/// heaps' records and the submitting thread: each of them was found waiting
+/// for that lock or in it (profile p1, 2026-11-26: 2.1 % of the submitting
+/// thread's samples under `retire_resource`, 2.2 % of the mirroring thread's,
+/// which the submitting thread then waits for). A thread now puts into a
+/// line of its own, by turns among these. `VICTORY_RETIRE_LINES=0`: one line
+/// for all, as before.
+const RETIRING: usize = 16;
+
+/// The calling thread's line.
+fn retiring() -> &'static Mutex<std::collections::VecDeque<(u64, Retired)>> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static MINE: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRING;
+    }
+    if !crate::toggled!("VICTORY_RETIRE_LINES") {
+        return &RETIRED[0];
+    }
+    &RETIRED[MINE.try_with(|&m| m).unwrap_or(0)]
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -459,7 +483,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    retiring()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((started, Retired::Any(Box::new(object))));
@@ -475,7 +499,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retiring().lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -494,15 +518,17 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
-        }
-        retired.drain(..n).collect()
-    };
-    drop(done);
+    for line in &RETIRED {
+        let done: Vec<(u64, Retired)> = {
+            let mut retired = line.lock().unwrap_or_else(|e| e.into_inner());
+            let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+            if n == 0 {
+                continue;
+            }
+            retired.drain(..n).collect()
+        };
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and

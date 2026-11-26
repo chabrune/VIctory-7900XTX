@@ -321,9 +321,10 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// `VICTORY_CARD_TOUCHED=0`: every copy is looked at, as before.
 static TOUCHED: Mutex<Vec<(u64, std::sync::Weak<Shadow>)>> = Mutex::new(Vec::new());
 
+/// (The list is kept either way, so that the switch can change while the
+/// title runs, `VICTORY_AB`.)
 fn touched_list() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_TOUCHED").is_none_or(|v| v != "0"))
+    crate::toggled!("VICTORY_CARD_TOUCHED")
 }
 
 /// A new copy in the card's memory joins the others, numbered in their
@@ -337,7 +338,7 @@ fn carded(shadow: &Arc<Shadow>) {
     let me = (NEXT.fetch_add(1, Ordering::Relaxed), Arc::downgrade(shadow));
     all.push(me.1.clone());
     // (Changed before it was numbered: listed now.)
-    if card.me.set(me.clone()).is_ok() && card.touched.load(Ordering::Acquire) && touched_list() {
+    if card.me.set(me.clone()).is_ok() && card.touched.load(Ordering::Acquire) {
         TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me);
     }
 }
@@ -668,6 +669,9 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
     };
     if !touched_list() {
+        // (The list is emptied first: what is put on it from here on is of
+        // changes this walk may not see.)
+        TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).clear();
         carded.retain(|weak| {
             let Some(shadow) = weak.upgrade() else {
                 return false;
@@ -4180,7 +4184,6 @@ impl Shadow {
         }
         // (Under the lock: what takes the list sees it or finds it set.)
         if !card.touched.swap(true, Ordering::AcqRel)
-            && touched_list()
             && let Some(me) = card.me.get()
         {
             TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
