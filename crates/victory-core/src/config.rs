@@ -18,6 +18,8 @@ use crate::policy::ensure_outside_repo;
 pub struct Config {
     /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
+    /// Folder containing the PC FidelityFX upscaler for the optional FSR profile.
+    pub fidelityfx_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
     /// What titles write and must keep (persistent local storage). Never
@@ -39,6 +41,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             game_dir: None,
+            fidelityfx_dir: None,
             cache_dir: PathBuf::new(),
             data_dir: PathBuf::new(),
             test_titles: Vec::new(),
@@ -85,6 +88,7 @@ struct FileLog {
 #[serde(deny_unknown_fields)]
 struct FilePaths {
     game_dir: Option<PathBuf>,
+    fidelityfx_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     #[serde(default)]
@@ -137,6 +141,7 @@ impl Config {
             .map_or_else(|| "victory.toml".to_owned(), |p| p.display().to_string());
         let FilePaths {
             game_dir,
+            fidelityfx_dir,
             cache_dir: file_cache,
             data_dir: file_data,
             test_titles: file_titles,
@@ -210,6 +215,7 @@ impl Config {
 
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(game_dir),
+            fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(fidelityfx_dir),
             cache_dir,
             data_dir,
             test_titles,

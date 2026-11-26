@@ -5,6 +5,8 @@
 # -RayTracingLow the same light with the title's trace programs run one frame in three, by turns
 #               (what they wrote stands in between): about 30 frames a second on an RX 7700 XT
 # -TextureStore keeps the textures' larger levels on disk so that they show at once next time
+# -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance), series-x only;
+#               after Belobug/VIctory-Belobug-AMD cd8dfc0 (README.md says where its DLL comes from)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Console      series-x (the default: 3840x2160) or series-s: the title renders lower and
@@ -18,6 +20,7 @@ param(
     [switch]$RayTracing,
     [switch]$RayTracingLow,
     [switch]$TextureStore,
+    [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [hashtable]$More = @{}
@@ -34,6 +37,7 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing -or $RayTracingLow) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($RayTracingLow) {
     # The title's 13 trace programs (those that test rays against its structures) each run
     # in one frame of three to six, by turns, and what they wrote stands in between; the
@@ -146,7 +150,7 @@ $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
