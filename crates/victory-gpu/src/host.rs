@@ -8809,9 +8809,17 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with `overlay` (the
+    /// title's interface plane and its state) drawn over it
+    /// ([`crate::planes`]). `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8896,10 +8904,26 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            // The interface plane over the picture, then the capture of what
+            // is shown: the back buffer if a plane was drawn over it.
+            let composed = overlay.is_some_and(|(o, s)| {
+                crate::planes::compose(self, list, &back, format, (width, height), texture, o, D3D12_RESOURCE_STATES(s as i32))
+            });
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| {
+                    if composed {
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        let read = crate::capture::read_back(&self.device, list, &back);
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                        read
+                    } else {
+                        crate::capture::read_back(&self.device, list, texture)
+                    }
+                })
                 .flatten();
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = composed;
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]

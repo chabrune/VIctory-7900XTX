@@ -38,6 +38,8 @@ mod book;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod planes;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;

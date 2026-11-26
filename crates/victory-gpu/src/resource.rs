@@ -2650,6 +2650,16 @@ fn resource<'a>(this: This) -> &'a Resource {
     unsafe { &*this.cast::<Resource>() }
 }
 
+/// Diagnostics: a title resource's size and format, as `WxH f<format>`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn description(this: This) -> String {
+    if this.is_null() {
+        return "null".to_owned();
+    }
+    let d = &resource(this).desc;
+    format!("{}x{} f{}", d.width, d.height, d.format)
+}
+
 // The creation methods' own arguments, passed on.
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(

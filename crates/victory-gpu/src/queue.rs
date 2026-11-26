@@ -850,6 +850,42 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Diagnostics: what the title presents, each time it differs from what it
+/// presented before (at most 16 shapes): how many planes, and of each the
+/// resources (size, format) and the first 64 bytes of its parameters, read
+/// as 8-byte words (the layer reads only the token, the count and the
+/// resource list of the first; the rest says placement and blending).
+#[cfg(feature = "diagnostics")]
+fn describe_planes(planes: u32, parameters: *const u8) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    const STRIDE: usize = PLANE_STRIDE;
+    if parameters.is_null() || planes == 0 || planes > 8 {
+        return;
+    }
+    let mut shape = format!("{planes} planes");
+    let mut words = Vec::new();
+    for p in 0..planes as usize {
+        // SAFETY: the title passes `planes` descriptions; 64 bytes of the
+        // last may reach past its end, into the title's own stack frame.
+        let raw = unsafe { std::slice::from_raw_parts(parameters.add(p * STRIDE).cast::<u64>(), 8) };
+        words.push(format!("{p}: {:x?}", raw));
+        let (count, list) = (raw[1] as u32, raw[2] as *const This);
+        shape.push_str(&format!("; plane {p}: {count} resources"));
+        for r in 0..count.min(4) as usize {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *list.add(r) };
+            let desc = crate::resource::description(resource);
+            shape.push_str(&format!(" [{desc}]"));
+        }
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 16 && !seen.contains(&shape) {
+        seen.push(shape.clone());
+        tracing::info!(shape, words = ?words, "the title presents");
+    }
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -864,6 +900,8 @@ extern "system" fn present(
     let _ = this;
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(feature = "diagnostics")]
+    describe_planes(planes, plane_parameters.cast());
     let called = crate::timeline::span("the title's Present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -948,8 +986,19 @@ extern "system" fn present(
         } else {
             None
         };
+        // The interface plane ([`crate::planes`]), as plane 0 is.
+        let overlay = plane_resource(planes, plane_parameters, 1)
+            .filter(|_| crate::planes::on())
+            .and_then(|resource| {
+                crate::resource::host_copy(resource).map(|copy| {
+                    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                    crate::resource::host_transition(resource, state);
+                    let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+                    (copy, state)
+                })
+            });
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), overlay, Shown { frame, resource });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -969,8 +1018,19 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        // The interface plane ([`crate::planes`]), as plane 0 is.
+        let overlay = plane_resource(planes, plane_parameters, 1)
+            .filter(|_| crate::planes::on())
+            .and_then(|r| Some((r, crate::resource::host_resource(r)?)))
+            .map(|(r, o)| {
+                let s = crate::resource::host_transition(r, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                (r, o, s)
+            });
+        show(texture, state, overlay.map(|(_, o, s)| (o, s)), Shown { frame, resource: resource as usize });
         crate::resource::host_transition(resource, state);
+        if let Some((r, _, s)) = overlay {
+            crate::resource::host_transition(r, s);
+        }
         let _ = host;
     }
     #[cfg(not(windows))]
@@ -979,6 +1039,27 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
     S_OK
+}
+
+/// The bytes between two of the console's present plane descriptions:
+/// token, resource count, resource list, source rectangles, placement, then
+/// colour space, filter and flags (read from what the title passes with two
+/// planes: the second's token is 72 bytes after the first's).
+const PLANE_STRIDE: usize = 72;
+
+/// The first resource of plane `index` of the `planes` the title presents.
+fn plane_resource(planes: u32, parameters: *const Plane, index: u32) -> Option<This> {
+    if index >= planes || parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions, `PLANE_STRIDE` apart.
+    let plane = unsafe { &*parameters.cast::<u8>().add(index as usize * PLANE_STRIDE).cast::<Plane>() };
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    (!resource.is_null()).then_some(resource)
 }
 
 /// Diagnostics: the title's present is over.
@@ -1001,13 +1082,19 @@ struct Shown {
     resource: usize,
 }
 
-/// Shows `texture`, in host state `state`, in our window.
+/// Shows `texture`, in host state `state`, in our window, with `overlay`
+/// (the interface plane, in its state) over it.
 #[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let shown = host.present(texture, state, overlay, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
