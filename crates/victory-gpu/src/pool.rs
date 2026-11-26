@@ -520,9 +520,15 @@ pub(crate) fn buffer_blocks() -> [u64; 3] {
     ]
 }
 
-/// Bytes asked for and number of the buffers in the card's memory that are
-/// allocations of their own and alive ([`count_own`]), by size: up to 4 KiB,
-/// up to 64 KiB, up to 1 MiB, larger.
+/// What the driver gives a buffer of its own in the card's memory, whatever
+/// was asked of it: a multiple of 256 KiB. (1000 buffers of 64 KiB made one
+/// after another on a device of their own took 250 MB of the card's memory,
+/// 2026-11-26.) A buffer cut from a block takes a multiple of 64 KiB instead.
+const OWN_ROUND: u64 = 256 << 10;
+
+/// Bytes the card gives and number of the buffers in the card's memory that
+/// are allocations of their own and alive ([`count_own`]), by size: up to
+/// 4 KiB, up to 64 KiB, up to 1 MiB, larger.
 static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn own_class(size: u64) -> usize {
@@ -534,16 +540,19 @@ fn own_class(size: u64) -> usize {
     }
 }
 
-/// Counts `buffer`, an allocation of its own of `size` bytes in the card's
-/// memory, for as long as it lives.
+/// Counts `buffer`, an allocation of its own of `size` bytes asked for in the
+/// card's memory, for as long as it lives. What is counted is what the card
+/// gives it ([`OWN_ROUND`]), not what was asked: a buffer of 32 bytes costs
+/// as much as one of 256 KiB.
 pub(crate) fn count_own(buffer: &ID3D12Resource, size: u64) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be714);
-    let class = own_class(size);
-    let piece = Piece { block: 0, start: 0, len: size };
+    let given = size.max(1).next_multiple_of(OWN_ROUND);
+    let class = own_class(given);
+    let piece = Piece { block: 0, start: 0, len: given };
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, buffer: false, own: true }));
     // (Counted first: the object takes it back when it goes, at once if the
     // buffer does not take it.)
-    OWN[2 * class].fetch_add(size, Ordering::Relaxed);
+    OWN[2 * class].fetch_add(given, Ordering::Relaxed);
     OWN[2 * class + 1].fetch_add(1, Ordering::Relaxed);
     // SAFETY: as in `give_back_with`.
     unsafe {
@@ -553,7 +562,7 @@ pub(crate) fn count_own(buffer: &ID3D12Resource, size: u64) {
 }
 
 /// For the memory line: [`count_own`]'s buffers alive, by size class, KiB
-/// asked for and number.
+/// the card gives and number.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn own_buffers() -> [u64; 8] {
     std::array::from_fn(|i| {

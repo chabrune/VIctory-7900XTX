@@ -794,7 +794,7 @@ fn log_memory() {
         let buffers = crate::pool::buffer_blocks();
         let own = crate::pool::own_buffers();
         tracing::info!(
-            "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers; of the textures' blocks {held} MB are held by {pieces} textures as the host sizes them, {resting} MB rest after their texture went, {empty} blocks are empty; blocks of buffers in the card's memory (VICTORY_BUFFER_POOL=0: none) {} MB, of them {} MB held by {} buffers; buffers in the card's memory that are allocations of their own, KiB asked for and number: up to 4 KiB {} in {}, up to 64 KiB {} in {}, up to 1 MiB {} in {}, larger {} in {}",
+            "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers; of the textures' blocks {held} MB are held by {pieces} textures as the host sizes them, {resting} MB rest after their texture went, {empty} blocks are empty; blocks of buffers in the card's memory (VICTORY_BUFFER_POOL=0: none) {} MB, of them {} MB held by {} buffers; buffers in the card's memory that are allocations of their own, KiB the card gives (256 KiB apiece at least) and number: up to 4 KiB {} in {}, up to 64 KiB {} in {}, up to 1 MiB {} in {}, larger {} in {}",
             buffers[0],
             buffers[1],
             buffers[2],

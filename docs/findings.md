@@ -163,10 +163,25 @@ was found, and what was done about it:
   world with 1 GiB of windows in card memory the CPU maps: 3.4 GB. Of it that 1 GiB;
   0.6 GB there before the world (view heaps, the swap chain, what the driver keeps);
   0.47 GB of 39 buffers of more than 1 MiB that are allocations of their own (the big
-  copies); 0.25 GB of 2,000 lists and their preludes (64 KiB of the card each); 3,100
-  buffers of 4 KiB and less (the hashes kept for copies: 12 MB). About 1 GB is left
-  that nothing here names, and it grows by a few MB in ten seconds. The memory line
-  counts the buffers that are allocations of their own by size.
+  copies);   0.25 GB of 2,000 lists and their preludes (64 KiB of the card each); 3,100
+  buffers of 4 KiB and less (the hashes kept for copies: 12 MB by their sizes). About
+  1 GB is left that nothing here names, and it grows by a few MB in ten seconds. The
+  memory line counts the buffers that are allocations of their own by size.
+- **Those 3,100 small buffers were the missing gigabyte.** The line counted what was
+  asked for, not what the card gives: 1000 buffers of 64 KiB made one after another
+  took 250 MB of the card's memory, 256 KiB each (an ignored test,
+  `host::place::tests::small_buffers_cost`). The 3,100 buffers of 4 KiB and less
+  therefore held about 775 MB, not 12, and the hashes kept for each copy (16 bytes a
+  piece) cost more than the copies they watch. What is written before it is read —
+  the hashes of a copy (filled whole when made), each list's indirect budget (zeroed
+  by its recording), the bytes between copies — is cut from the blocks of buffers now
+  (`Host::scratch_uav`), 64 KiB of a shared block instead of 256 KiB of its own. The
+  line counts what the driver gives, 256 KiB apiece at least. Two and a half minutes
+  into the world, Series S profile, the same settings: allocations of their own
+  39 buffers 0.47 GB + 3,100 of 4 KiB and less -> 20 buffers 0.41 GB and none small;
+  the textures alive on the card 38,000 -> 42,900, the frame 21-23 -> 24.1 fps
+  (41.5 ms), the card 9,680 MB of 9,941 in use. (One run each; the scene is not
+  exactly the same.)
 - **Empty blocks of textures** (nine of 64 MiB when the card is full) are kept on
   purpose: memory given back and read by a list still running lost the device twice.
 - **What the card reads over the bus**: the copies of windows of title memory (the
@@ -191,6 +206,8 @@ took 16.8 ms of the frame they fell in; they are written by a thread of their ow
    without rays.
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
    pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
+   (The ~830 MB the small buffers of their own gave back are enough for 2 GiB of the
+   title's windows in card memory beside the same textures: not measured yet.)
 4. Outdoor flicker: suspected to be one bad indirect record that uses up its list's
    budget, so that every later draw of it is empty. The log's frame line counts them;
    `VICTORY_INDIRECT_REST=0` is the experiment.

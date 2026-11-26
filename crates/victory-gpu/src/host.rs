@@ -4250,7 +4250,9 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                // (Filled whole from the card's side before it is asked
+                // anything: what it held before does not matter.)
+                let before = self.scratch_uav(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -6939,7 +6941,8 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        // (Zeroed by each recording that charges it, before any read.)
+        let buffer = host()?.scratch_uav(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -8734,6 +8737,11 @@ impl Meter {
                 slow[2] as f64 / 1e3
             );
             if crate::shadow::cards() {
+                let c = crate::shadow::card_written_census();
+                tracing::info!(
+                    "copies in the card's memory by whether a shader was ever declared to write them: title buffers never {} ({} MB), written {} ({} MB); windows never {} ({} MB), written {} ({} MB)",
+                    c[0], c[1] >> 20, c[2], c[3] >> 20, c[4], c[5] >> 20, c[6], c[7] >> 20
+                );
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
@@ -9445,6 +9453,16 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// A device-local buffer of `size` bytes whose bytes are all written
+    /// before any is read (a copy's destination, a hash pass's store, a
+    /// budget the list zeroes itself): cut from the blocks of buffers where
+    /// it can be, so that a few bytes do not cost the card the 256 KiB an
+    /// allocation of its own takes ([`crate::pool::count_own`]). What it
+    /// holds at first is another buffer's, which is what it is for.
+    pub(crate) fn scratch_uav(&self, size: u64) -> Option<ID3D12Resource> {
+        crate::pool::scratch_buffer(&self.device, size).or_else(|| self.uav_buffer(size))
     }
 }
 

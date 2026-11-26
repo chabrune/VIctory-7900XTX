@@ -240,7 +240,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                // (Each part is copied into it from the texture before it is
+                // copied out.)
+                let Some(buffer) = host.scratch_uav(bytes[0]) else {
                     return false;
                 };
                 crate::host::name(&buffer, || {
