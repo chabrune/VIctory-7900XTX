@@ -341,6 +341,13 @@ fn carded(shadow: &Arc<Shadow>) {
     if card.me.set(me.clone()).is_ok() && card.touched.load(Ordering::Acquire) {
         TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me);
     }
+    drop(all);
+    // Memory cut from a block that held another buffer before is not zeros,
+    // as the CPU's side is where nothing was copied into it yet: all of it
+    // goes up once.
+    if crate::pool::used_before(&shadow.buffer) {
+        shadow.card_changed(0, card.size as usize);
+    }
 }
 
 /// Since the last frame line: bytes copied to card sides and the ranges
@@ -454,7 +461,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = crate::pool::card_buffer(&host.device, size).or_else(|| host.uav_buffer(size));
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -580,7 +587,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = crate::pool::card_buffer(&host.device, size).or_else(|| host.uav_buffer(size));
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }

@@ -318,6 +318,8 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
 
 /// Bytes of the pieces textures hold now.
 static HELD: AtomicU64 = AtomicU64::new(0);
+/// How many pieces that is.
+static PIECES: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
@@ -329,6 +331,18 @@ pub(crate) fn texture_room() -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+}
+
+/// For the memory line: of the blocks of textures, the MiB textures hold
+/// (as the host sizes them: what a piece is, not what the texture's texels
+/// are), the MiB of pieces given back that rest, the blocks with nothing in
+/// them, and how many pieces are held.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_blocks() -> [u64; 4] {
+    let pool = lock(&TEXTURES);
+    let resting: u64 = pool.resting.iter().map(|(_, p)| p.len).sum();
+    let empty = pool.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count() as u64;
+    [HELD.load(Ordering::Relaxed) >> 20, resting >> 20, empty, PIECES.load(Ordering::Relaxed)]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -372,6 +386,8 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// A piece of the blocks of buffers ([`card_buffer`]), not of textures.
+    buffer: bool,
 }
 
 struct Methods([*const (); 3]);
@@ -408,8 +424,15 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            if gone.buffer {
+                BUFFERS_HELD[0].fetch_sub(gone.piece.len, Ordering::Relaxed);
+                BUFFERS_HELD[1].fetch_sub(1, Ordering::Relaxed);
+                lock(&BUFFERS).give(gone.piece, now());
+            } else {
+                HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                PIECES.fetch_sub(1, Ordering::Relaxed);
+                lock(&TEXTURES).give(gone.piece, now());
+            }
         }
         left
     }
@@ -434,10 +457,11 @@ fn made_now(texture: &ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+/// Makes `texture` (or a buffer, `buffer`) give `piece` back when the last
+/// reference to it goes.
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, buffer: bool) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, buffer }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -446,6 +470,122 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
+        }
+    }
+}
+
+/// What buffers in a block are cut on (the host places a buffer at
+/// multiples of it).
+const K64: u64 = 64 << 10;
+
+/// Blocks of the card's memory that buffers are cut from ([`card_buffer`]).
+static BUFFERS: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE));
+/// Bytes of the pieces buffers hold now, and how many pieces.
+static BUFFERS_HELD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Buffers cut from a part of a block that was used before, until asked
+/// about ([`used_before`]): what is there is not zeros, as a new
+/// allocation's memory is.
+static USED_BEFORE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether buffers in the card's memory are cut from blocks
+/// (`VICTORY_BUFFER_POOL=0`: each an allocation of its own, as before).
+///
+/// The driver of an RX 7700 XT gives a buffer of its own in the card's memory
+/// a multiple of 256 KiB: 256 KiB for one of 64 KiB, 512 for one of 280
+/// (512 of each made on a device of their own and the card's memory in use
+/// asked for before and after, 2026-11-26). The copies of title buffers from
+/// 64 KiB up were 3,704 buffers of 1,022 MB by their own sizes then. Cut
+/// from a block a buffer takes a multiple of 64 KiB.
+pub(crate) fn buffers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_POOL").is_none_or(|v| v != "0"))
+}
+
+/// For the memory line: blocks of buffers in MiB, the MiB buffers hold in
+/// them, and how many buffers.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffer_blocks() -> [u64; 3] {
+    [
+        lock(&BUFFERS).blocks() as u64 * (BLOCK >> 20),
+        BUFFERS_HELD[0].load(Ordering::Relaxed) >> 20,
+        BUFFERS_HELD[1].load(Ordering::Relaxed),
+    ]
+}
+
+/// Whether `buffer` was cut from a part of a block that held another buffer
+/// before (asked once: the answer is forgotten).
+pub(crate) fn used_before(buffer: &ID3D12Resource) -> bool {
+    let raw = buffer.as_raw() as usize;
+    let mut used = lock(&USED_BEFORE);
+    match used.iter().position(|&u| u == raw) {
+        Some(i) => {
+            used.swap_remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A buffer of at least `size` bytes with unordered access in a block of the
+/// card's memory, in the common state; `None`: not pooled (too big for half
+/// a block, or the switch is off), or the host refused.
+pub(crate) fn card_buffer(device: &ID3D12Device, size: u64) -> Option<ID3D12Resource> {
+    if !buffers_on() {
+        return None;
+    }
+    let len = size.max(1).next_multiple_of(K64);
+    let (piece, heap, again) = lock(&BUFFERS).take(len, K64, now(), || {
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: BLOCK,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            tracing::warn!(error = %e, "no block of buffer memory");
+        }
+        // (Waited for as a buffer of its own is, `Host::uav_buffer`.)
+        if let Some(h) = &heap
+            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+        {
+            tracing::warn!(error = %e, "a block of buffer memory is not resident");
+            return None;
+        }
+        heap
+    })?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: the piece is no one else's; the heap lives while a piece of
+    // it is taken.
+    let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made) };
+    match (result, made) {
+        (Ok(()), Some(made)) => {
+            BUFFERS_HELD[0].fetch_add(piece.len, Ordering::Relaxed);
+            BUFFERS_HELD[1].fetch_add(1, Ordering::Relaxed);
+            give_back_with(&made, piece, true);
+            if again {
+                lock(&USED_BEFORE).push(made.as_raw() as usize);
+            }
+            Some(made)
+        }
+        (result, _) => {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, size, "no buffer in a block of the card's memory");
+            }
+            lock(&BUFFERS).give(piece, now());
+            None
         }
     }
 }
@@ -505,7 +645,8 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            PIECES.fetch_add(1, Ordering::Relaxed);
+            give_back_with(&made, piece, false);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
