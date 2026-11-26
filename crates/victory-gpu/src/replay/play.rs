@@ -651,15 +651,33 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
+        // (Each named: an error of the card's says nothing of where it was;
+        // and with what the debug layer said, if it is on.)
+        let said = |player: &Player, e: anyhow::Error, what: &'static str| {
+            let mut layer = player.info.as_ref().map(debug_messages).unwrap_or_default();
+            layer.extend(removal_data(&player.device));
+            let e = e.context(what);
+            if layer.is_empty() { e } else { e.context(layer.join("\n")) }
+        };
+        if let Err(e) = player.make_resources(options.buffers, &options.only_buffers) {
+            return Err(said(&player, e, "making the capture's resources"));
+        }
         step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
+        if let Err(e) = player.make_pipelines(options.shaders.as_deref()) {
+            return Err(said(&player, e, "making the capture's pipelines"));
+        }
         step("pipelines", &mut at);
-        player.make_descriptors()?;
+        if let Err(e) = player.make_descriptors() {
+            return Err(said(&player, e, "making the capture's descriptors"));
+        }
         step("descriptors", &mut at);
-        player.load_contents()?;
+        if let Err(e) = player.load_contents() {
+            return Err(said(&player, e, "putting the capture's contents on the card"));
+        }
         step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
+        if let Err(e) = player.make_masters(options.buffers, options.restore) {
+            return Err(said(&player, e, "making the copies to restore from"));
+        }
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -767,8 +785,13 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed; and
+        // made not resident (0x800), which the host makes its new memory
+        // with to wait for its mapping (`crate::host::not_resident`) and
+        // then makes resident: left in, the first copy into such a texture
+        // was a page fault and the card was lost ("the contents of textures
+        // and buffers", batch 0).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -785,10 +808,23 @@ impl Player {
                 .filter(|id| !textures.contains(id))
                 .collect()
         };
+        // `VICTORY_REPLAY_HEAPS=<id>,..`: these heaps in the card's memory
+        // whatever they were (an experiment: what the card gains by not
+        // reading them over the bus).
+        let to_card: HashSet<u32> = std::env::var("VICTORY_REPLAY_HEAPS")
+            .map(|v| v.split(',').filter_map(|id| id.trim().parse().ok()).collect())
+            .unwrap_or_default();
         for h in &self.frame.heaps {
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
-                Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
+                Properties: if to_card.contains(&h.id) {
+                    D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    }
+                } else {
+                    props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id))
+                },
                 Alignment: h.alignment,
                 Flags: D3D12_HEAP_FLAGS(h.flags & !DROP),
             };
@@ -1408,6 +1444,15 @@ impl Player {
         if parts.is_empty() {
             return Ok(());
         }
+        // `VICTORY_REPLAY_SLOW=1`: each batch waited for, to name the one the
+        // card is lost in; `=2`: each part a batch of its own (`contents.txt`
+        // in the capture says what each part is of).
+        let slow = std::env::var("VICTORY_REPLAY_SLOW").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+        if slow >= 2 {
+            batches = (0..parts.len()).map(|i| vec![(i, 0)]).collect();
+            most = parts.iter().map(|p| p.1).max().unwrap_or(0);
+        }
+        let slow = slow >= 1;
         let mut stagings: Vec<(ID3D12Resource, usize, u64)> = Vec::new();
         for _ in 0..batches.len().min(2) {
             let (b, data) = gpu::buffer(
@@ -1462,8 +1507,13 @@ impl Player {
             let sent = worker.send(|l| copy(self, l, &list, &buffer));
             self.worker = worker;
             stagings[k].2 = sent?;
+            if slow {
+                self.worker
+                    .wait(stagings[k].2)
+                    .with_context(|| format!("batch {n} of {}: parts {}..={} of {}", batches.len(), batch[0].0, batch[batch.len() - 1].0, parts.len()))?;
+            }
         }
-        self.worker.idle()?;
+        self.worker.idle().context("the last batches of an upload")?;
         Ok(())
     }
 
@@ -1493,18 +1543,49 @@ impl Player {
             .map(|c| (c.clone(), c.len, c.file))
             .collect();
         let missing = self.frame.contents.len() - textures.len();
-        self.worker.run(|list| {
-            // SAFETY: an open list; live resources.
-            unsafe {
-                for all in early.chunks(1000) {
-                    list.ResourceBarrier(all);
-                }
-                list.ResourceBarrier(&[alias()]);
-                for all in into.chunks(1000) {
-                    list.ResourceBarrier(all);
+        if std::env::var_os("VICTORY_REPLAY_SLOW").is_some() {
+            eprintln!(
+                "before the contents: the card's memory (budget, used, the PC's used, MB) {:?}; {} resources, {} heaps",
+                self.memory(),
+                self.objects.len(),
+                self._heaps.len()
+            );
+            let mut text = String::new();
+            for (i, (c, _, _)) in textures.iter().enumerate() {
+                if let Some(o) = self.objects.get(&c.res) {
+                    let r = &self.frame.resources[o.index];
+                    text.push_str(&format!(
+                        "{i} res {} '{}' first {} count {} len {} zero {} desc {:?} place {:?} made_in {:#x} state {:x?} late {}\n",
+                        c.res,
+                        r.name,
+                        c.first,
+                        c.count,
+                        c.len,
+                        c.file == ZERO,
+                        r.desc,
+                        r.place,
+                        r.made_in,
+                        r.state,
+                        r.late
+                    ));
                 }
             }
-        })?;
+            let _ = std::fs::write(self.folder.join("contents.txt"), text);
+        }
+        self.worker
+            .run(|list| {
+                // SAFETY: an open list; live resources.
+                unsafe {
+                    for all in early.chunks(1000) {
+                        list.ResourceBarrier(all);
+                    }
+                    list.ResourceBarrier(&[alias()]);
+                    for all in into.chunks(1000) {
+                        list.ResourceBarrier(all);
+                    }
+                }
+            })
+            .context("the resources' states before their contents")?;
         let file = File::open(self.folder.join("contents.bin"))?;
         self.upload(&textures, &file, |player, list, parts, staging| {
             for (c, len, at) in parts {
@@ -1538,7 +1619,8 @@ impl Player {
                     }
                 }
             }
-        })?;
+        })
+        .context("the contents of textures and buffers")?;
         // To the states of the frame's start.
         let mut back = Vec::new();
         for r in &self.frame.resources {
@@ -1549,12 +1631,14 @@ impl Player {
                 gpu::moves(&o.res, &[COPY_DEST], state, &mut back);
             }
         }
-        self.worker.run(|list| {
-            for all in back.chunks(1000) {
-                // SAFETY: an open list; live resources.
-                unsafe { list.ResourceBarrier(all) };
-            }
-        })?;
+        self.worker
+            .run(|list| {
+                for all in back.chunks(1000) {
+                    // SAFETY: an open list; live resources.
+                    unsafe { list.ResourceBarrier(all) };
+                }
+            })
+            .context("the resources' states after their contents")?;
         if missing > 0 {
             self.note(format!(
                 "contents of {missing} parts of resources that could not be made are left out"
@@ -3067,6 +3151,8 @@ impl Player {
             }
             submissions = vec![all];
         }
+        // Which of the lists sent alone (`wait_lists`) the card was lost in.
+        let mut alone = 0usize;
         // SAFETY: closed lists whose last run has finished.
         unsafe {
             for all in &submissions {
@@ -3082,7 +3168,11 @@ impl Player {
                 }
                 for l in all {
                     self.worker.queue.ExecuteCommandLists(std::slice::from_ref(l));
-                    self.worker.idle()?;
+                    let sent = alone;
+                    alone += 1;
+                    self.worker
+                        .idle()
+                        .with_context(|| format!("the card was lost running list {sent} of those sent, alone (with the copies of what the CPU wrote)"))?;
                 }
             }
             self.worker
@@ -3098,7 +3188,7 @@ impl Player {
 
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
-        let mut made = self.prepare(o)?;
+        let mut made = self.prepare(o).context("building the frame's lists")?;
         let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
         for _ in 0..o.loops.max(1) {
@@ -3125,7 +3215,7 @@ impl Player {
 
     /// One run of the frame, noted in the report; its timestamps.
     fn once(&mut self, o: &Options, (built, report): &mut (Sends, Report)) -> Result<Vec<u64>> {
-        self.restore(o.restore)?;
+        self.restore(o.restore).context("putting back what the last run changed")?;
         self.fresh = false;
         let stamps = self.send(built, o)?;
         if let Some((db, _, hash, _)) = self.picture_now()? {
@@ -3502,6 +3592,75 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
         let info = device.cast::<ID3D12InfoQueue>().ok();
         Ok((device, info))
     }
+}
+
+/// What the system noted of a lost device (`--breadcrumbs`): the address of
+/// a page fault with the allocations it lies in, and for each list that did
+/// not finish how far it came and the command it stopped at.
+fn removal_data(device: &ID3D12Device) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
+        return out;
+    };
+    // SAFETY: the outputs are the runtime's, valid while the device lives;
+    // nodes are walked as linked, histories have their counts.
+    unsafe {
+        if device.GetDeviceRemovedReason().is_ok() {
+            return out;
+        }
+        if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            && fault.PageFaultVA != 0
+        {
+            out.push(format!("page fault at {:#x}", fault.PageFaultVA));
+            for (what, head) in [
+                ("inside", fault.pHeadExistingAllocationNode),
+                ("inside freed", fault.pHeadRecentFreedAllocationNode),
+            ] {
+                let mut names = Vec::new();
+                let mut node = head;
+                while let Some(n) = node.as_ref()
+                    && names.len() < 8
+                {
+                    let name = if n.ObjectNameW.is_null() {
+                        "unnamed".to_owned()
+                    } else {
+                        n.ObjectNameW.to_string().unwrap_or_default()
+                    };
+                    names.push(format!("{name} (type {})", n.AllocationType.0));
+                    node = n.pNext;
+                }
+                if !names.is_empty() {
+                    out.push(format!("  {what} {names:?}"));
+                }
+            }
+        }
+        if let Ok(crumbs) = dred.GetAutoBreadcrumbsOutput() {
+            let mut node = crumbs.pHeadAutoBreadcrumbNode;
+            let mut lists = 0;
+            while let Some(p) = node.as_ref() {
+                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                lists += 1;
+                if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() && out.len() < 24 {
+                    let history = std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                    let from = (done as usize).saturating_sub(3);
+                    let to = (done as usize + 3).min(history.len());
+                    let ops: Vec<i32> = history[from..to].iter().map(|op| op.0).collect();
+                    let name = if p.pCommandListDebugNameW.is_null() {
+                        String::new()
+                    } else {
+                        p.pCommandListDebugNameW.to_string().unwrap_or_default()
+                    };
+                    out.push(format!(
+                        "list {lists} \"{name}\" stopped after {done} of {} commands; operations {from}..{to}: {ops:?}",
+                        p.BreadcrumbCount
+                    ));
+                }
+                node = p.pNext;
+            }
+            out.push(format!("{lists} lists in the breadcrumbs"));
+        }
+    }
+    out
 }
 
 /// The debug layer's errors: how many of each kind, and its first text.
