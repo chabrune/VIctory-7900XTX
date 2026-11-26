@@ -579,6 +579,47 @@ it uses on Series X; the same 1280x720 to 1920x1080) the picture is smooth, at t
 same frame rate. The profile uses it now. Its scale (`VICTORY_RENDER_SCALE=0.8`) ends
 the title at its start on this profile, as the other sizes do.
 
+## The PC's memory with the title's ray tracing (2026-11-26, evening)
+
+An RX 7700 XT, 32 GB, the Series S profile with `-RayTracingLow`,
+`VICTORY_QUIET_GUARD=1` and `VICTORY_PRELUDE_POOL=1`; the PC's other programs hold 12
+GB (a browser, the editor, chat). The title then stands at 26 to 27 GB private with
+0.9 to 2.7 GB of the PC's memory free, and a run in which it fell to 0.9 GB had frames
+of 380 and 625 ms and 18.6 frames a second on average (run b0) where the same build
+gives 29 with 2.7 GB free: the average is the paging's before it is the card's.
+
+Where it is (run ram-map1, three minutes in; committed, and of it in memory):
+
+| | MB | in memory |
+|---|---|---|
+| the title's heaps (private) | 4,269 | 2,280 |
+| views of the title's pages | 5,862 | 2,590 |
+| the process heap | 2,406 | 1,691 |
+| windows of title memory, 4 MiB each | 2,744 | 2,127 |
+| other private allocations of 1 MB and more | 4,249 | 3,155 |
+| write-combined | 12,248 | 2,952 |
+| files and mappings at host addresses | 7,728 | 2,088 |
+
+- The 125 write-combined allocations of 64 MB (8 GB) are the card's own heaps as the
+  driver maps them (texture blocks, buffer blocks, the arenas' card sides): they are
+  not the PC's memory. What is: the memory shared with the card, 8.2 GB in use, of
+  which the windows outside buffers 3.3 GB (794 of them), the copies of title buffers
+  1.9 GB and the CPU's sides of the arenas of memory by address 1.3 GB (20 private
+  allocations of 64 MB).
+- The mappings at host addresses are views of ours of the title's sections (the
+  guards', renderer port 1's): the same pages as the title's views, counted twice.
+- Of the windows, 1,671 MB lie between the lowest and highest address ever asked for
+  in each. By what could be opened in place (`VICTORY_INPLACE_PROBE=1`): 67 (316 MB)
+  in private memory committed whole, 426 (1,740 MB) in view memory with unmapped pages,
+  288 (1,168 MB) in private memory not committed whole or guarded, none in one run of a
+  section; the title's four sections are made reserved, which the host refuses as
+  heaps.
+
+`VICTORY_MEMORY_DIRECT=1` runs in the title (run ram-direct1, no error): the title's
+heaps 3,029 MB against 4,269, 25,150 MB private against 26,000 to 26,290 at the same
+time of the run. With `VICTORY_WINDOW_KB=1024` and `VICTORY_WINDOW_TAILS=1` the title
+stayed at its first menu (11 draws a frame for 100 s, run ram-fine1): not looked into.
+
 ## Ray tracing in play, and the merge of Belobug's branch (2026-11-26, night)
 
 An RX 7700 XT, 32 GB, the Series S profile, `scripts\play.ps1 -RayTracingLow`, the clock
@@ -682,3 +723,53 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+### Read again on 2026-11-26 (evening): every branch of every clone
+
+Fetched and read by commit message and chosen diffs, nothing of it built or run here
+unless said. "Not here" was checked by searching this tree for the switch or the
+function named.
+
+**Taken that day.** Belobug `a-publier` whole (cd8dfc0: the PC FidelityFX bridge for
+the Series X profile, textures uploaded in the submission's prelude, the texture cap by
+the card's memory `VICTORY_TEXTURE_MAX`, indirect batch buffers from a pool, the guard
+on the driver's compiler; merge 318d2f6). avatarmanz 5a2f8c6 (`VICTORY_PIPELINE_LOW_MEMORY`,
+off). fxceless 41f9857 (a moved view keeps the title's minimum level) and af23c65
+(`submit_split` gives its tables' slots back). The last three applied as they were.
+
+**Not taken yet, by what they would help.**
+
+- The card's memory and the textures: xcl b6fd1f27 (branch `amd-dev`: render targets
+  the title maps at two addresses over the same pages share their card memory, 3,597 to
+  1,738 MB of targets there; here targets are kept by address, 722 of 1,388 MB);
+  Marvisak 9a12a45 (depth twins share their scratch buffers, one a size); fxceless
+  e4245f3, the part for its issue 3198 (a texture the card had no room for is asked
+  again after a second: here `refused` is for the run); Marvisak 61bfc77 (placed
+  unordered texture views as real ones: this tree's log says "placed unordered texture
+  view not mirrored", 11 times in two minutes); codec-d/cool_fox f4b48ad (one-shot bakes
+  wait for their textures, with `VICTORY_UPLOAD_AHEAD` and `VICTORY_SHOW_AFTER` as the
+  profile has them); fxceless 19a45d1 (a view of a texture the card wrote is copied
+  from it after an upload too).
+- The preparing thread: xcl 71b8e6e0 (a submission whose lists were all closed before
+  the last look at the write watch began takes none of its own, a quarter of them
+  there); DexNom bc3cd4b (only the root views a program stores through are declared
+  written; the translation cache's form changes).
+- The translator, to be done as one lot since each change makes the cache again:
+  Marvisak cc7ec2a (64-bit compares AMD's driver gets wrong), 94c1ead (anisotropic heap
+  samplers keep point mips), e04c078 (a program's constant table without its
+  instructions); fxceless f6a09d3 (the fused multiply-add of the console: water
+  reflections) and 06702fe (BC7 rotation); DexNom 76749ce (a wave64 mask restored: one
+  more program translated); cool_fox's fix of the tracer at a join.
+- The PC's memory: nothing but avatarmanz's switch above and xcl 28946bb1 (a big
+  compile waits for commit headroom: one program of 29.8 MB had taken the driver past
+  14 GB).
+
+**Measured elsewhere and no gain** (not to be done again): fxceless's branch
+`stretch-port` (`VICTORY_STRETCH`: windows of view memory placed on a view of ours, 1
+and 9 windows placed in two runs; here 0 of 789 windows are one run of a section and
+426, 1,740 MB, lie over unmapped pages: run ram-map1), its `VICTORY_LIGHT_REFRESH`,
+`VICTORY_HEAP_LOCKS` and `VICTORY_TABLE_STAGES`; xcl's heaps in the card's memory
+(reads over the bus some thirty times slower) and its console FSR 4 (11 ms a frame on
+an RX 9070); DexNom after its bridge has README commits only; Belobug `main` is its
+older line (5 to 7 fps), Leonida does not start the title, and the remotes of cool_fox
+and Leonida are gone.
