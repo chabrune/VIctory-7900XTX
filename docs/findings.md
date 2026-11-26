@@ -196,25 +196,70 @@ chain (12.7 ms a frame, one frame in four all of it); the title's own commands t
 the submitting thread works 32 to 35 ms. The lines the frame meter logged once a second
 took 16.8 ms of the frame they fell in; they are written by a thread of their own now.
 
-## The queue of textures picked by index, in parts, 2026-11-26
+## 30 frames a second on an RX 7700 XT, and what took it there (2026-11-26)
 
-The submitting thread stands blocked for 40 % of its wait on one lock: the queue of
-slots whose texture view waits to be brought up to date (`descriptor::host::TextureQueue`),
-which the threads that translate lists take for every texture view they write (4.9 ms of
-a 33 ms frame). It is now in 16 parts, each with a lock of its own, by slot
-(`VICTORY_TEXTURE_SHARDS`; 1: one lock for all of it, as before).
+Series S profile, i5-14600KF, 32 GB, the opening cutscene; one run a figure unless said.
 
-What does not change is the order textures are served in: `due` picks them by the
-number of their write, and that number comes from one counter over all the parts, so
-the newest-first/oldest-next turns of the backlog come out as before (the tests of the
-queue, `the_texture_queue_serves_the_newest_writes_first` among them, run on the parts).
-What changes is who waits for whom: two threads writing slots of different parts no
-longer wait for each other, and the pass that takes the due slots once a frame locks
-each part in turn instead of the one lock every write of the frame went through. A bulk
-look at a list of slots (a page written under a texture) is one lock a part, not one a
-slot.
+| Step | fps | The preparing thread, ms a frame |
+|---|---|---|
+| Before | 25 | 38.9 |
+| The title's heap of constants in place (`VICTORY_PORT_CONSTANTS=1`, avatarmanz's renderer port 1; now in the profile) | 27-28 | 35.1 |
+| The heaps' records asked for when the title submits (`VICTORY_HEAPS_AT_SUBMIT`) | 28-29 | 32.5-33.5 |
+| Blocks of the title's general allocator write-watched (`VICTORY_ALLOC_WATCHED`) | 29-30 | 30.3-32.0 |
 
-Not measured yet on the title: `VICTORY_TEXTURE_SHARDS=1` is the A/B of the same run.
+**The title submits two or three times a frame; the layer makes 28 parts of it.** Its lists
+wait for memory values (labels the card writes when a list has run: 19.7 of some 20 waits
+a frame are met by a list sent before), and each part was prepared on its own: the write
+watch asked, the heaps' records brought up, the refreshes flushed. 13 parts are joined to
+the one before; what stands between the others, a frame: a wait for a memory value 5, a
+step done on the CPU 3, the most lists joined 2, memory the parts before write 1 (the log's
+"parts not prepared with the one before them").
+
+**The heaps' records.** The preparing thread asked for a round of them per part, when it
+came to the part, a frame of work after the title wrote the records, and stood 6 to 7.5 ms
+a frame until the round was over. Asked for when the title gives its lists to a queue, one
+round for all their parts: 2 ms left. It rests on the waits being the card's own labels:
+were one released by the title's CPU after it wrote more records, the round would be too
+early.
+
+**A 20 MB buffer copied whole twice a frame.** `XMemAllocDefault` took its big blocks from
+the process heap, where nothing says what was written; the title places buffers of the
+card's in them (seven at the start of the world). The copy of one, written by shaders
+only, was copied whole at every refresh (42 MB, 4.6 to 6.3 ms a frame), sent up whole and
+fetched back whole. The blocks are allocations of their own now, write-watched. The log
+says so when a copy of a megabyte and more is neither watched nor guarded.
+
+**In place is not the answer for what shaders write.** The same blocks opened as the
+card's own memory (`VICTORY_ALLOC_INPLACE=1`): 21 fps, the card waited for 13 to 15 ms a
+frame. A heap opened on the PC's memory is read and written over the bus. Renderer port 1
+gains because constants are small reads; geometry and shader-written buffers belong in the
+card's memory. What is left for those is not to fetch back what nothing on the CPU reads
+(69 MB a frame fetched, 21 of them this buffer): it needs the pages kept from the CPU until
+something touches them.
+
+**The 30 is ours, not the title's.** The title asks for a frame every 33,333 us and is
+paced by its wait for our clock. `VICTORY_FRAME_US=16667`: the menus run at 60 fps; the
+world stays at 29 to 30, the preparing thread's 31 ms. Whether the title's own timing
+holds at 60 has to be looked at by a person.
+
+**What the title's main thread does while it "runs".** 60 % of its time is a loop
+(`monitorx`, `mwaitx`, `Sleep(0)`, image +0x4fb0bd0) on one of those labels: it waits for
+the card, so its 15 ms of a frame's chain are the preparing thread's, the card's and the
+landing's, seen from the other side. 11 of 20 processors are busy: the title's threads 3.6,
+the eight that translate lists 3.3.
+
+Measured and no different here (on and off by turns of 8 s in one run): avatarmanz's
+`VICTORY_ASK_SPREAD`, `VICTORY_UP_QUEUE`, `VICTORY_JOIN_BARRIERS`; worse:
+`VICTORY_LANE_CORE` (48.6 ms a frame against 37.4), `VICTORY_ASK_NORESET` (40.2 against
+37.8); `VICTORY_PORT_DESCRIPTORS` with port 1: 25 fps, and some 20 slots a second its
+patches do not tell of (writers at title +0x18849c, +0x4e9b4e2, +0x2474afc and a system
+copy). The list threads on the slow cores: 28 fps both ways. More geometry in card memory
+(`VICTORY_WINDOWS_BAR_MB=2048`): 25 fps both, 22,100 textures alive against 32,700.
+
+codec-d/cool_fox (avatarmanz at 0a43566 with six commits for an RTX 5090: two planes
+composed, a guard on the PC's memory, XMA corrections, NVIDIA lowering), built and run
+here with its launcher's settings: 13 fps in the same scene, then 5 (the card waited for
+50, then 176 ms a frame: 11.8 GB of textures uploaded on a 12 GB card).
 
 ## What the translated shaders are made of (2026-11-26)
 
@@ -257,10 +302,13 @@ compare and a select; the three instructions are the same either way.)
 
 ## What is next
 
-1. The preparing thread: split what one submission does over two threads in a row; ask
-   for the next submission while this one is sent; view the card's own buffers where fills
-   copy them now. (The queue of textures picked by index no longer has one lock for the
-   frame: see above.)
+1. Past 30: the preparing thread works 31 ms a frame (asking the write watch 4.7,
+   refreshes 8.3 of which 9,400 of 10,600 copy nothing, copies and fills 2.7, copies in the
+   card's memory 2.3). One preparation for all the parts of one call of the title's, done
+   when it calls and beside the thread that sends, is the shape that halves it; what
+   shaders write not fetched back until something on the CPU reads it takes the landing's
+   19 ms of other threads; then the card's own 28 ms (the translated programs are 2.4 times
+   the console's instructions).
 2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
    after fxceless c36971b2; not measured here yet), and the passes that run for nothing
    without rays.
