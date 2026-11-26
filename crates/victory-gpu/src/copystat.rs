@@ -792,11 +792,20 @@ fn log_memory() {
         let [textures, staging] = crate::pool::memory();
         let [held, resting, empty, pieces] = crate::pool::texture_blocks();
         let buffers = crate::pool::buffer_blocks();
+        let own = crate::pool::own_buffers();
         tracing::info!(
-            "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers; of the textures' blocks {held} MB are held by {pieces} textures as the host sizes them, {resting} MB rest after their texture went, {empty} blocks are empty; blocks of buffers in the card's memory (VICTORY_BUFFER_POOL=0: none) {} MB, of them {} MB held by {} buffers",
+            "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers; of the textures' blocks {held} MB are held by {pieces} textures as the host sizes them, {resting} MB rest after their texture went, {empty} blocks are empty; blocks of buffers in the card's memory (VICTORY_BUFFER_POOL=0: none) {} MB, of them {} MB held by {} buffers; buffers in the card's memory that are allocations of their own, KiB asked for and number: up to 4 KiB {} in {}, up to 64 KiB {} in {}, up to 1 MiB {} in {}, larger {} in {}",
             buffers[0],
             buffers[1],
-            buffers[2]
+            buffers[2],
+            own[0],
+            own[1],
+            own[2],
+            own[3],
+            own[4],
+            own[5],
+            own[6],
+            own[7]
         );
     }
     let targets = crate::resource::targets_census();

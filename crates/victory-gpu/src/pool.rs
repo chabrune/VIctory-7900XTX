@@ -388,6 +388,9 @@ struct Reclaim {
     piece: Piece,
     /// A piece of the blocks of buffers ([`card_buffer`]), not of textures.
     buffer: bool,
+    /// No piece at all: a buffer of its own, counted while it lives
+    /// ([`count_own`]; `piece.len` is its bytes).
+    own: bool,
 }
 
 struct Methods([*const (); 3]);
@@ -424,7 +427,12 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            if gone.buffer {
+            if gone.own {
+                // Not a piece: a buffer of its own that was counted.
+                let class = own_class(gone.piece.len);
+                OWN[2 * class].fetch_sub(gone.piece.len, Ordering::Relaxed);
+                OWN[2 * class + 1].fetch_sub(1, Ordering::Relaxed);
+            } else if gone.buffer {
                 BUFFERS_HELD[0].fetch_sub(gone.piece.len, Ordering::Relaxed);
                 BUFFERS_HELD[1].fetch_sub(1, Ordering::Relaxed);
                 lock(&BUFFERS).give(gone.piece, now());
@@ -461,7 +469,7 @@ fn made_now(texture: &ID3D12Resource) {
 /// reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece, buffer: bool) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, buffer }));
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, buffer, own: false }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -510,6 +518,48 @@ pub(crate) fn buffer_blocks() -> [u64; 3] {
         BUFFERS_HELD[0].load(Ordering::Relaxed) >> 20,
         BUFFERS_HELD[1].load(Ordering::Relaxed),
     ]
+}
+
+/// Bytes asked for and number of the buffers in the card's memory that are
+/// allocations of their own and alive ([`count_own`]), by size: up to 4 KiB,
+/// up to 64 KiB, up to 1 MiB, larger.
+static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn own_class(size: u64) -> usize {
+    match size {
+        0..=4096 => 0,
+        4097..=65536 => 1,
+        65537..=1048576 => 2,
+        _ => 3,
+    }
+}
+
+/// Counts `buffer`, an allocation of its own of `size` bytes in the card's
+/// memory, for as long as it lives.
+pub(crate) fn count_own(buffer: &ID3D12Resource, size: u64) {
+    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be714);
+    let class = own_class(size);
+    let piece = Piece { block: 0, start: 0, len: size };
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, buffer: false, own: true }));
+    // (Counted first: the object takes it back when it goes, at once if the
+    // buffer does not take it.)
+    OWN[2 * class].fetch_add(size, Ordering::Relaxed);
+    OWN[2 * class + 1].fetch_add(1, Ordering::Relaxed);
+    // SAFETY: as in `give_back_with`.
+    unsafe {
+        let object = IUnknown::from_raw(made.cast());
+        let _ = buffer.SetPrivateDataInterface(&KEY, &object);
+    }
+}
+
+/// For the memory line: [`count_own`]'s buffers alive, by size class, KiB
+/// asked for and number.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn own_buffers() -> [u64; 8] {
+    std::array::from_fn(|i| {
+        let v = OWN[i].load(Ordering::Relaxed);
+        if i % 2 == 0 { v >> 10 } else { v }
+    })
 }
 
 /// Whether `buffer` was cut from a part of a block that held another buffer

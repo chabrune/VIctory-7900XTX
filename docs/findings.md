@@ -159,9 +159,16 @@ was found, and what was done about it:
 - With both, the textures the title fills that are alive on the card went from 15,800
   (1.4 GB) to 47,000-58,000, and the texture queue no longer finds the card without
   room (152 passes of it did in two minutes).
-- **Not accounted for yet**: about 2.4 GB of the card's memory in use that is neither a
-  block of textures or buffers nor a target (0.6 GB of it before the world; some 0.6 GB
-  are lists, their preludes and the big copies). It still grows slowly in the world.
+- **What is neither a block of textures or buffers nor a target**, two minutes into the
+  world with 1 GiB of windows in card memory the CPU maps: 3.4 GB. Of it that 1 GiB;
+  0.6 GB there before the world (view heaps, the swap chain, what the driver keeps);
+  0.47 GB of 39 buffers of more than 1 MiB that are allocations of their own (the big
+  copies); 0.25 GB of 2,000 lists and their preludes (64 KiB of the card each); 3,100
+  buffers of 4 KiB and less (the hashes kept for copies: 12 MB). About 1 GB is left
+  that nothing here names, and it grows by a few MB in ten seconds. The memory line
+  counts the buffers that are allocations of their own by size.
+- **Empty blocks of textures** (nine of 64 MiB when the card is full) are kept on
+  purpose: memory given back and read by a list still running lost the device twice.
 - **What the card reads over the bus**: the copies of windows of title memory (the
   title's own vertices, indices and constants, 3.4 GB) are in the PC's memory, because
   the card has no room (`VICTORY_CARD_WINDOWS_MB`, 0). Moving the title buffers from
