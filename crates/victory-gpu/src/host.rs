@@ -8589,6 +8589,21 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        // The lines below are a second's counters put into words, fifteen of
+        // them and every five seconds some sixty more: 16 ms of the frame
+        // they fell in, on the thread that shows frames, also with their
+        // writing on a thread of its own (a timeline of eight frames at 25 a
+        // second, an RX 7700 XT, 2026-11-26: 2.0 ms a frame in "the frame
+        // meter"). A thread of the meter's makes them now; the counters are
+        // the same atomics, taken a moment later.
+        // `VICTORY_METER_ASIDE=0`: made here, as before.
+        let five = self.logged.elapsed() >= std::time::Duration::from_secs(5);
+        if five {
+            self.logged = std::time::Instant::now();
+        }
+        #[cfg(feature = "diagnostics")]
+        let stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) } else { 0 };
+        let lines = move || {
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -8676,8 +8691,7 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
+        if five {
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -8808,8 +8822,8 @@ impl Meter {
                     put[2] / 1e6,
                     put[3]
                 );
-                traffic::line(self.copy_stats_frames as f64);
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                traffic::line(stats_frames as f64);
+                crate::copystat::log(stats_frames as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -8818,6 +8832,8 @@ impl Meter {
                 }
             }
         }
+        };
+        meter_lines(Box::new(lines));
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];
@@ -10603,3 +10619,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+
+/// Runs a second's lines of the frame meter on a thread of its own
+/// (`VICTORY_METER_ASIDE=0`: on the calling thread).
+fn meter_lines(lines: Box<dyn FnOnce() + Send>) {
+    static ASIDE: OnceLock<Option<std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send>>>> = OnceLock::new();
+    let aside = ASIDE.get_or_init(|| {
+        if std::env::var_os("VICTORY_METER_ASIDE").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (send, receive) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(8);
+        std::thread::Builder::new()
+            .name("victory-meter".into())
+            .spawn(move || {
+                for lines in receive {
+                    lines();
+                }
+            })
+            .ok()
+            .map(|_| send)
+    });
+    match aside {
+        // (A second's lines still being made when the next are due: those
+        // wait their turn; past eight seconds of them the meter waits.)
+        Some(send) => {
+            if let Err(e) = send.send(lines) {
+                (e.0)();
+            }
+        }
+        None => lines(),
+    }
+}
