@@ -50,6 +50,16 @@ if ($Console -eq 'series-s') {
     # alive on the card 50,000 / 38,000 / 20,000 (the card is full: what windows take, textures
     # lose), frames 21-23 / 22 / 23 a second. -More @{VICTORY_WINDOWS_BAR_MB='0'} or '2048'.
     $settings.VICTORY_WINDOWS_BAR_MB = '1024'
+    # The title's 185 MB heap of constants read by the card where the title writes it (renderer
+    # port 1 of avatarmanz/VIctory-7900XTX): nothing of it sent up, fetched back or compared. RX
+    # 7700 XT, opening cutscene (2026-11-26), three runs with against one without: 27-28 fps
+    # against 25, the submitting thread 35.1 ms a frame against 38.9; the picture as before.
+    # The other switches of that tree measured here in the same run, on and off by turns
+    # (VICTORY_AB): VICTORY_LANE_CORE worse (48.6 ms a frame against 37.4), VICTORY_ASK_NORESET
+    # 40.2 against 37.8, VICTORY_ASK_SPREAD, VICTORY_UP_QUEUE and VICTORY_JOIN_BARRIERS no
+    # different; VICTORY_PORT_DESCRIPTORS with it 25 fps and slots its patches miss.
+    # -More @{VICTORY_PORT_CONSTANTS='0'}: as before.
+    $settings.VICTORY_PORT_CONSTANTS = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
