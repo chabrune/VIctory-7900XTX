@@ -43,6 +43,13 @@ if ($Console -eq 'series-s') {
     # visibly sharper (hair, edges), at the same frame rate (20.1 fps both, the
     # same scene, RX 7700 XT).
     $settings.VICTORY_FSR_SHARPNESS = '0.5'
+    # 1 GiB of the windows of title memory (its own vertices, indices and constants) in card
+    # memory the CPU writes straight into, so that draws do not read them over the bus and the
+    # PC keeps no second copy. RX 7700 XT, opening cutscene (2026-11-26), none / 1 GiB / 2 GiB:
+    # card working 32 / - / 27 ms a frame, the PC's free memory 1.5 / 2.3 / 3.5 GB, textures
+    # alive on the card 50,000 / 38,000 / 20,000 (the card is full: what windows take, textures
+    # lose), frames 21-23 / 22 / 23 a second. -More @{VICTORY_WINDOWS_BAR_MB='0'} or '2048'.
+    $settings.VICTORY_WINDOWS_BAR_MB = '1024'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
