@@ -1646,7 +1646,104 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Slots of a CPU-only view heap of ours, handed out in turn, for the
+/// second descriptor `ClearUnorderedAccessView*` wants (one the CPU reads
+/// when the call is recorded, so a slot is free again at once).
+fn clear_slot() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    const SLOTS: u32 = 256;
+    struct Ring {
+        heap: ID3D12DescriptorHeap,
+        start: usize,
+        step: usize,
+        next: std::sync::atomic::AtomicU32,
+    }
+    // SAFETY: descriptor heaps are free-threaded; a slot is written and read
+    // by one recording call.
+    unsafe impl Send for Ring {}
+    // SAFETY: as above.
+    unsafe impl Sync for Ring {}
+    static RING: std::sync::OnceLock<Option<Ring>> = std::sync::OnceLock::new();
+    let ring = RING
+        .get_or_init(|| {
+            let host = host()?;
+            let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            // SAFETY: plain creation and queries.
+            unsafe {
+                let heap: ID3D12DescriptorHeap = host
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: SLOTS,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                        NodeMask: 0,
+                    })
+                    .ok()?;
+                let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                let step = host.device.GetDescriptorHandleIncrementSize(kind) as usize;
+                Some(Ring { heap, start, step, next: std::sync::atomic::AtomicU32::new(0) })
+            }
+        })
+        .as_ref()?;
+    let _ = &ring.heap;
+    let at = ring.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SLOTS;
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: ring.start + at as usize * ring.step })
+}
+
 impl HostHeap {
+    /// Makes the title's unordered view `view` at slot `index` of this
+    /// shader-visible heap (a dynamic slot the caller took) and at a slot of
+    /// a CPU-only heap of ours: the two descriptors
+    /// `ClearUnorderedAccessView*` wants. Gives the CPU-only one and the host
+    /// resource viewed; `None` if the view cannot be made on the host.
+    pub(crate) fn clear_view(&self, index: u32, view: &View) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+        if self.sampler || index >= self.count + self.dynamic {
+            return None;
+        }
+        let cpu = clear_slot()?;
+        let resource = make(view, cpu)??;
+        let host = host()?;
+        // SAFETY: a slot of our CPU-only heap, copied to a slot of ours.
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(index), cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        self.clear_twin(index);
+        // Held by the slot until another view takes it, as `raw_uav_at` does.
+        self.keep(index, Some(resource.clone()));
+        Some((cpu, resource))
+    }
+
+    /// A raw unordered view of `len` bytes of `buffer` from `offset` (on 16
+    /// bytes) at dynamic slot `index` and at a CPU-only slot of ours, for
+    /// `ClearUnorderedAccessViewUint` of a buffer: the CPU-only slot.
+    pub(crate) fn clear_raw_view(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        offset: u64,
+        len: u64,
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        if self.sampler || index >= self.count + self.dynamic || !offset.is_multiple_of(16) {
+            return None;
+        }
+        let cpu = clear_slot()?;
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: offset / 4,
+                    NumElements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        let host = host()?;
+        // SAFETY: a slot of our CPU-only heap and a live buffer covering the range.
+        unsafe { host.device.CreateUnorderedAccessView(buffer, None::<&ID3D12Resource>, Some(&desc), cpu) };
+        self.raw_uav_at(index, buffer, offset, len);
+        Some(cpu)
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {

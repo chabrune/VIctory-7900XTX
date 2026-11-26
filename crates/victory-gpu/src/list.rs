@@ -1338,6 +1338,67 @@ pub(crate) struct Rect {
     bottom: i32,
 }
 
+/// `ClearUnorderedAccessViewUint(gpu, cpu, resource, values, count, rects)`
+/// (0x1a8, after the render target clear as on PC) and `...Float` (0x1b0):
+/// the view whose record is at the CPU handle is cleared on the host
+/// ([`crate::draw::State::clear_uav`]); the GPU handle is the title's heap
+/// slot of the same view, and a slot of ours stands for it.
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, cpu, resource, values, false, count, rects);
+}
+/// See [`clear_uav_uint`].
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, cpu, resource, values.cast(), true, count, rects);
+}
+/// Both clears of unordered views; `float`: `values` are the floats' bits.
+pub(super) fn clear_uav(
+    this: This,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    float: bool,
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // `VICTORY_UAV_CLEAR=0`: left out, as before.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_UAV_CLEAR").is_none_or(|v| v != "0")) {
+            return;
+        }
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(&values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let rects: &[windows::Win32::Foundation::RECT] = if count > 0 && !rects.is_null() {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        } else {
+            &[]
+        };
+        with_state(this, |list, s| s.clear_uav(list, cpu, resource, values, float, rects));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, cpu, resource, values, float, count, rects);
+}
+
 extern "system" fn clear_rtv(
     this: This,
     handle: u64,
@@ -2306,7 +2367,9 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 11] = [
+    (53, clear_uav_uint as *const ()),         // 0x1a8
+    (54, clear_uav_float as *const ()),        // 0x1b0
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0

@@ -1676,6 +1676,167 @@ impl State {
         true
     }
 
+    /// `ClearUnorderedAccessViewUint` / `Float` (`float`: `values` are the
+    /// four floats' bits) of the title's view whose record is at `record`
+    /// (its CPU handle, or a copy of the record) over `resource`. The view is
+    /// made at a dynamic slot of the bound view heap and at a CPU-only slot
+    /// of ours, the two descriptors the host's clear wants; the texture goes
+    /// to unordered access first, and a barrier follows, so that the passes
+    /// after it read the cleared values.
+    ///
+    /// The title's FidelityFX upscaler (`amd_fidelityfx_upscaler_xbox.dll`,
+    /// loaded with the Series S profile) clears its own buffers and textures
+    /// this way (call at +0x72ee); the slot was not written, and the clear
+    /// did nothing. Left out, said once, without a bound view heap, a record
+    /// that is no view, or a view the host cannot make.
+    pub(crate) fn clear_uav(
+        &mut self,
+        list: &HostList,
+        record: u64,
+        resource: This,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) {
+        let Some(view) = crate::descriptor::view(record) else {
+            once!("a UAV clear of a record that is no view: left out");
+            return;
+        };
+        let heap = match self.heaps[0] {
+            0 => None,
+            h => Some(crate::descriptor::heap(h as This)),
+        };
+        let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
+            once!("a UAV clear without a bound view heap: left out");
+            return;
+        };
+        let Some(index) = host.dynamic(1) else {
+            return;
+        };
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
+        // A buffer: its host copy, made now if no draw has used it yet,
+        // brought up to date and noted as written by shaders (the clear is
+        // a shader write as far as copying back is concerned), then cleared
+        // through a raw view of the view's bytes.
+        if let View::Unordered(r, _, desc) = &view
+            && let Some((data, len)) = crate::resource::buffer_bytes(*r as This)
+        {
+            // The title's words: format, dimension, first element (two words),
+            // elements, stride, counter offset (two), flags.
+            let d = desc.unwrap_or([0; 10]);
+            const RAW: u32 = 1;
+            let unit = if d[5] > 0 {
+                u64::from(d[5])
+            } else if d[8] & RAW != 0 {
+                4
+            } else {
+                crate::resource::element(d[0]).map_or(4, |(bytes, _)| bytes)
+            };
+            let first = (u64::from(d[2]) | u64::from(d[3]) << 32) * unit;
+            let bytes = if desc.is_some() { u64::from(d[4]) * unit } else { len };
+            let start = data as u64 + first.min(len);
+            let bytes = bytes.min(len.saturating_sub(first));
+            let Some(shadow) = crate::shadow::find(start, bytes.max(1)) else {
+                once!(start = format_args!("{start:#x}"), bytes, "a UAV clear of a buffer without a host copy: left out");
+                return;
+            };
+            // SAFETY: a live buffer.
+            let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+            if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+                once!("a UAV clear of a buffer whose host copy shaders cannot write: left out");
+                return;
+            }
+            shadow.refresh(list, start, bytes);
+            shadow.gpu_writes(list, start, bytes);
+            let offset = shadow.offset(start);
+            let Some(cpu) = host.clear_raw_view(index, &shadow.buffer, offset, bytes) else {
+                once!(offset, "a UAV clear of a buffer not on 16 bytes of its host copy: left out");
+                return;
+            };
+            static BUFFER_CLEARS: AtomicU64 = AtomicU64::new(0);
+            let n = BUFFER_CLEARS.fetch_add(1, Ordering::Relaxed) + 1;
+            // A raw view takes the bits as they are: a float clear's too.
+            let target = &shadow.buffer;
+            // SAFETY: an open list; slots of ours holding a view of a live buffer.
+            unsafe {
+                list.list.ClearUnorderedAccessViewUint(host.gpu_handle(index), cpu, target, &values, rects);
+                let after = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::transmute_copy(target),
+                        }),
+                    },
+                };
+                list.list.ResourceBarrier(&[after]);
+            }
+            if n <= 8 || n.is_power_of_two() {
+                tracing::info!(n, float, ?values, bytes, offset, "a buffer's unordered view cleared");
+            }
+            return;
+        }
+        let Some((cpu, target)) = host.clear_view(index, &view) else {
+            let r = match &view {
+                View::Unordered(r, _, _) => *r as This,
+                _ => std::ptr::null(),
+            };
+            let copy = crate::resource::host_resource(r).map(|t| {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                (d.Format.0, d.Width, d.Height, d.Flags.0)
+            });
+            let twin = crate::resource::twin_resource(r).is_some();
+            once!(?view, ?copy, twin, "a UAV clear of a view the host cannot make: left out");
+            return;
+        };
+        const UNORDERED: u32 = 0x8;
+        static CLEARS: AtomicU64 = AtomicU64::new(0);
+        let n = CLEARS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            // SAFETY: a live resource.
+            let desc = unsafe { target.GetDesc() };
+            tracing::info!(
+                n,
+                float,
+                ?values,
+                dimension = desc.Dimension.0,
+                width = desc.Width,
+                height = desc.Height,
+                format = desc.Format.0,
+                rects = rects.len(),
+                "an unordered view cleared"
+            );
+        }
+        // SAFETY: an open list; slots of ours holding a view of a live resource.
+        unsafe {
+            if let Some((texture, before)) = list.transition(resource, UNORDERED) {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATES(UNORDERED as i32),
+                )]);
+            }
+            let gpu = host.gpu_handle(index);
+            if float {
+                let floats = values.map(f32::from_bits);
+                list.list.ClearUnorderedAccessViewFloat(gpu, cpu, &target, &floats, rects);
+            } else {
+                list.list.ClearUnorderedAccessViewUint(gpu, cpu, &target, &values, rects);
+            }
+            let after = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::transmute_copy(&target),
+                    }),
+                },
+            };
+            list.list.ResourceBarrier(&[after]);
+        }
+    }
+
     /// Binds a root UAV: a raw unordered access view of the title buffer's
     /// host copy from `address` on, as a one-view table (a null view
     /// without an address, without a host copy shaders can write, or at an
