@@ -431,6 +431,70 @@ memory, 24 to 25 GB private with 2 to 2.6 GB free.
 5. Memory, 40-46 GB private: lists' allocators 9 GB, windows 7, uploads 4
    (`VICTORY_MEMORY_MAP=1` lists it).
 
+## The card's 26 ms taken apart with a replayed frame (2026-11-26, afternoon)
+
+An RX 7700 XT, the Series S profile, the opening cutscene with the clock at 60 Hz: 34.5
+to 35 frames a second, the card working 25.7 ms a frame, the preparing thread 26 to 27
+(renderer ports 6 and 7 of avatarmanz/VIctory-7900XTX, on in the profile: 28.1 before).
+
+`victory replay` lost the card on every capture of this tree: the host makes its new
+memory not resident and then resident (`host::not_resident`), the capture records the
+flag, and the replay made every resource with it and nothing resident, so its first copy
+into a texture was a page fault. Fixed; a failed load now says the stage, the batch,
+what the debug layer said and where the system's breadcrumbs stopped. A captured frame
+(40 submissions, 291 lists, 39,000 host commands) runs in 26.3 ms of the card with no
+title beside it, against 25.7 to 26 in the title: the frame is the card's.
+
+By kind (`--timing detailed`; a command's time is a share of its list): the title's
+3,063 dispatches 9.1 ms, its 3,407 indirect mesh draws 3.5, 920 indirect dispatches 3.2,
+733 draws 2.4, 1,884 barriers 1.1, our 159 argument clamps 1.0, 346 indirect draws 0.9,
+242 texture copies on the card 0.7, our 520 compare passes 0.6, 150 buffer copies from
+the PC 0.55. Of the 3,742 dispatches 734 are ours. What the experiments say, each
+against 26.3 ms:
+
+| replay | ms | what it is |
+|---|---|---|
+| `--no-barriers` | 24.2 | the 870 waits for every earlier shader write (690 for the title's barrier groups, two for each clamp); in the title, `VICTORY_BARRIER_TEST=both`: 24.8 against 25.9 |
+| `VICTORY_REPLAY_HEAPS=<the heap in place>` | 24.6 | the title's 185 MB of constants and skinned vertices in the card's memory instead of read in place over the bus (renderer port 1) |
+| `--skip-hash-passes` | 25.2 | our compare and hash passes |
+| `--buffers vram --only-buffers "name=list scratch"` | 25.6 | lists' scratch memory in the card's; 25.2 against 26.4 with the tables' constant buffers copied there (`VICTORY_PORT_CBV_PLACE=0`) |
+| all four | 22.3 | |
+| `--buffers vram` (everything) | 163 | 14.8 GB asked of a 10.3 GB budget: what the card does when its memory is over |
+
+So four fifths of the card's time is the title's own work, about 21 to 22 ms here, and
+ours is about 4. In the title, lists' scratch chunks in card memory the CPU maps
+(`VICTORY_SCRATCH_CARD=1`) gave no gain that could be told from the noise; it stays a
+switch. The title's memory use stands over the card's budget all the time (10.9 GB in
+use against 10.25).
+
+### Copies of one memory
+
+Every 64 KiB block of view memory that shaders are declared to write is shown by the
+title at two addresses or more (two to sixteen), and two blocks in three have a copy at
+more than one of them: one buffer of 24 or 50 MB over all of a pool's pages, and small
+buffers over parts of the same pages. Each copy has its own bytes on the card, and they
+meet only by way of title memory: compared, fetched, put into title memory, found
+written by the guards of the other view, sent up again. That is what the compare passes
+and most of the bus traffic are for now (4,000 to 5,400 pieces compared and 24 to 35 MB
+fetched a frame).
+
+Memory with an owner took such blocks through one copy since the morning. That was not
+exact: what shaders then wrote through the other copy stayed in that copy's bytes (620
+blocks a frame declared written that way, run k3), and the refresh of the other copy
+brought the block down again (1,350 of 3,000 taken). Now a block or a copy is taken only
+where no other copy holds the same memory (`shadow::copies_holding`): 1,390 blocks
+taken, 75 brought down, 33 to 34 frames a second against 34.5 to 35
+(`VICTORY_CARD_SHARED=1`: as before, for measuring).
+
+What follows from it, and is the next piece of work: the copies of one page share the
+card's memory. Card sides as reserved buffers whose 64 KiB tiles come from a pool
+(`tiles.rs` does it for textures); when a block is taken for the card, the other
+copies' tiles of that page are mapped to the taker's (`UpdateTileMappings`, in queue
+order), so that a shader's write through any of them is the others' at once, as on the
+console; when the block is brought down, they get their own tiles and the bytes again.
+Then every block shaders write can be the card's alone, and nothing of it is compared,
+fetched or sent up.
+
 ## The other repositories, compared
 
 Read up to 2026-11-25: Marvisak/VIctory, fxceless/victory-fork, DexNom/VIctory,
