@@ -579,6 +579,95 @@ it uses on Series X; the same 1280x720 to 1920x1080) the picture is smooth, at t
 same frame rate. The profile uses it now. Its scale (`VICTORY_RENDER_SCALE=0.8`) ends
 the title at its start on this profile, as the other sizes do.
 
+## Ray tracing in play, and the merge of Belobug's branch (2026-11-26, night)
+
+An RX 7700 XT, 32 GB, the Series S profile, `scripts\play.ps1 -RayTracingLow`, the clock
+at 60 Hz. What is asked for is 40 frames a second in the mean with the title's ray
+tracing and every texture; where it stands is 32 to 34 in the first scene that is
+played, and what follows says what the eight are made of.
+
+**The scenes.** A run's first two minutes are the opening cutscene (1,000 to 4,900
+draws a frame by shot, 28 to 31 fps); holding A skips it (`VICTORY_KEYS=..,58-63:Enter`
+in a measuring run) into the first scene that is played, the window (4,400 to 4,900
+draws, the same every frame: what the figures below are of), and the dormitory behind
+it is heavier than both (5,000 to 6,300 draws, the card working 41 to 47 ms a frame, 21
+to 23 fps). A pad held by a person does the same: two runs (m0, s50) left the cutscene
+that way and were first read as slower builds.
+
+**Belobug/VIctory-Belobug-AMD `a-publier`, merged** (three commits over upstream
+c9c932c, which was here already):
+
+- e942896: descriptor slots of a list let go when its submission lands (not 64
+  submissions later), the indirect batches' buffers from a pool shared by the lists,
+  views of a host copy that starts at a later level clamped for arrays too, textures
+  capped by the card's room (`VICTORY_TEXTURE_MAX`: 1024, 512 from 92 % of the budget,
+  256 from 97 %), an idle texture let go sooner, a guard for the AMD compiler crashing
+  on an RX 9070 XT, the panel in release builds.
+- 5d6bd84: a title texture's upload is recorded in the submission's prelude, after the
+  refresh that finds its memory changed, not by the next list that samples it: no frame
+  late, no flicker where parts of a frame are joined.
+- cd8dfc0: the title's FidelityFX served by AMD's PC library (`-Fsr4K`, Series X at 4K
+  only, the DLL the user's own): not what this card and profile can use yet.
+
+Four conflicts (the prelude now takes the pooled list and the uploads; the batches'
+buffers are still cut from the buffer blocks). One thing changed: the cap's percent
+counts the card's memory less what the texture blocks hold free, as the texture queue
+and the sweep do. Counted whole this card stands over 97 % for good and every texture
+made from then on would have been one of 256. The window scene after the merge: medians
+of 29.2 to 30.3 ms (33 to 34 fps, run g1) against 33.5 ms before it (run rt-low2); the
+picture whole in the shots.
+
+**What sets the frame there** (run g1): the card works 28.2 ms and is idle 2.0; the
+thread that prepares submissions works 25 ms. Each tried against that:
+
+| | frame, ms (median) | the card works | the preparing thread | |
+|---|---|---|---|---|
+| as it is | 29.2-30.3 | 28.2 | 24.1-26.0 | 28,700 textures alive |
+| trace programs one frame in 12, not 6 (`VICTORY_TRACE_EVERY_ALT=12`, by turns) | 29.5 against 30.0 | | | |
+| windows of title memory in card memory (`VICTORY_WINDOWS_BAR_MB=1024`) | 29.0-30.4 | 27.8 | 24.8-25.6 | 18,400 alive, 198 passes without room against 54 |
+| render scale 0.5 (`VICTORY_RENDER_SCALE=0.5`: 960x540) | 28.7-29.4 | 24.9, idle 4.9 | 26.0-26.7; the title waits 5.3 ms at presents | |
+| the same, built with thin LTO and one codegen unit | 28.9-30.2 | 25.3 | 25.7-26.6 | |
+| the title's own settings file lightened (`lodScale` 0.5, `rtDynamicShadows` false, `motionBlur` false, `uiResolution` 1920x1080 and others) | 30.4-32.2 | 29-30 | | the same draws, the same 13 trace programs, the 3840x2160 viewport still there: not read, or not at start; the file put back |
+
+So a smaller render size is worth 3.3 ms of the card and not one frame: below 2/3 the
+frame waits for the preparing thread, at 26 ms. Forty frames a second there is the card
+under 24 ms (the render scale does it, for a softer picture) **and** that thread under
+23, and its parts are what they were in the afternoon: 4.2 ms asking the write watch,
+13 to 14 in the lists' steps (8 of them 10,700 refreshes of which 9,300 copy nothing),
+2.3 for copies in the card's memory, 2 to 3 waiting for the heaps' records. Link-time
+optimisation does not touch it, so it is not our instructions that it spends. In the
+dormitory the card alone sets the frame, and there the render scale is worth what it is
+worth of the card (39 to 43 ms against 41 to 47).
+
+**The PC's memory.** Two runs in three before these were spoiled by it (0.9 to 1.9 GB
+free, lines of 2 to 3 fps while the system paged). With ray tracing the profile now has
+`VICTORY_QUIET_GUARD=1` and `VICTORY_MEMORY_DIRECT=1`, and on Series S
+`VICTORY_PRELUDE_POOL=1`: 3.4 to 4.4 GB free in the window scene against 2.4 to 2.8,
+24.3 to 24.6 GB private against 26.1 to 26.8, and the preparing thread 23.3 to 24.5 ms a
+frame against 24.1 to 26.0 (run v1, the profile as the menu starts it: 32 to 33 fps, no
+line of the log an error, the picture whole). A memory map of the afternoon's kind (run
+s50, 20 GB in memory): buffers shared with the card 3.3 GB (12.4 GB of addresses),
+other private allocations of a megabyte and more 3.9, files and mappings 2.9, views of
+the title's pages 2.6, the process heap 2.4, windows of title memory 2.3, the title's
+heaps 2.3.
+
+**The card's memory.** While the world loads 40,000 textures are uploaded (4.2 GB in
+5.1 GB of blocks), a third of them let go in the next twenty seconds, and the blocks
+stay: 4.4 to 4.9 GB of them for 2.7 to 3.1 GB held, since a block goes only when it is
+empty and each has textures that live long among those that do not. Found on the way:
+the blocks made ahead while the card had room were never let go once it had none (the
+pool only remembered what it was told to keep when it let blocks go: 7 empty blocks,
+448 MB, with the card at 99 % of its budget, run p1); they go now. What would bring the
+blocks to what they hold: moving the copies out of the emptiest block the way
+`resource::want_level` replaces a copy (the slots show the old one until the new one's
+upload has run), with `descriptor::host::levels_changed` to have the slots made again.
+Not done.
+
+**Two games at once.** A second session ran its own game and builds beside these runs
+and spoiled four of them (a run's last tables read 109 and 205 ms for the card, the
+system's commit 702 MB from its limit). The measuring script now says how many seconds
+of a run another game or a build ran, and the least memory the PC had free.
+
 ## The other repositories, compared
 
 Read up to 2026-11-25: Marvisak/VIctory, fxceless/victory-fork, DexNom/VIctory,
