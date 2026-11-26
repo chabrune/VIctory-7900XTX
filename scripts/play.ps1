@@ -60,6 +60,22 @@ if ($Console -eq 'series-s') {
     # different; VICTORY_PORT_DESCRIPTORS with it 25 fps and slots its patches miss.
     # -More @{VICTORY_PORT_CONSTANTS='0'}: as before.
     $settings.VICTORY_PORT_CONSTANTS = '1'
+    # Translated shaders read the title's constant buffers where they are (renderer port 5 of
+    # avatarmanz/VIctory-7900XTX: 10,900 tables' constant buffers a frame not copied), and a
+    # title buffer of a megabyte and more that shaders write is the card's alone until
+    # something on the CPU touches it (crates/victory-gpu/src/host/owner.rs: nothing of it
+    # compared or fetched). RX 7700 XT, opening cutscene, the clock at 60 Hz (2026-11-26):
+    # neither 30-31 fps, the card working 29.0 ms a frame, the preparing thread 30.3; port 5
+    # alone 32-33 fps, 26.8 and 29.5; both 33-34 fps, 27.4 and 26.5, 4.1 GB of the PC's
+    # memory free against 2.2; the picture the same. The first run with port 5 makes every
+    # pipeline again (minutes of a few frames a second, once).
+    # Tried and not usable on this profile: VICTORY_OUTPUT=2560x1440 (the title ends at its
+    # start, with or without VICTORY_UPSCALER=6 and VICTORY_RENDER_SCALE=0.5) and
+    # VICTORY_FFX_SCALE=0.6 (it ends where the world begins); series-x at VICTORY_OUTPUT=
+    # 1920x1080 runs at 19-20 fps (the card 44 ms a frame).
+    # -More @{VICTORY_PORT_CBV='0'; VICTORY_CARD_OWNED='0'}: as before.
+    $settings.VICTORY_PORT_CBV = '1'
+    $settings.VICTORY_CARD_OWNED = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
