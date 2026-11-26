@@ -299,6 +299,50 @@ two are written at once by the title, four (8, 16, 16, 8 MB) by nothing in 170 s
 a frame brought down for nobody. (We wrote zeros over each of them when it was made, over
 the system's own zeros: not any more.)
 
+## What comes back from the card comes back for nobody (2026-11-26, night)
+
+The largest single thing found that day. What shaders write to a copy in the card's memory
+was found by a compare on the card after every submission (8,300 pieces of 64 KiB a frame:
+544 MB looked through, in 500 passes of ours), fetched (69 MB a frame), merged into title
+memory, and found there as written by the next refresh, which tells it from the title's
+own writes and sends some of it up again (17 MB a frame up, 14 of them that).
+
+| Clock at 60 Hz, opening cutscene | fps | Preparing thread | Card working | Fetched a frame | Picture |
+|---|---|---|---|---|---|
+| As it was | 30-31 | 30.3 ms | 29.0 ms | 69 MB | right |
+| Nothing compared or fetched (`VICTORY_CARD_NO_BACK=1`) | 34-35 | 21.3 | 27.3 | 0 | black |
+| Not for copies of 1 MiB and more (`=1024`) | 35 | 25.5 | 27.1 | 9 MB | right |
+| The card owns copies of 1 MiB and more in private memory (`VICTORY_CARD_OWNED=1`) | 31-32 | 25.6-26.5 | 28.8 | 35.5 MB | right |
+
+- **The title does not steer by it.** With nothing fetched its calls are the same: 4,500
+  draws, 38,500 list calls, 12,200 buffer copies a frame. The black picture is a few small
+  things read back (under a megabyte in all: the 9 MB of small copies hold them).
+- **Copies over the same memory are not why either**: 1,412 pairs among 4,475 copies, 54 MB
+  where shaders write one of the two (`VICTORY_OVERLAPS=1`).
+- **So the bytes have an owner** (`crate::host::owner`). A copy shaders are declared to
+  write for the first time is brought up to date whole with its pages read-only, then its
+  pages are kept from the CPU (`PAGE_NOACCESS`) and nothing of it is compared, fetched or
+  refreshed. The first thing on the CPU that touches it faults; the handler has the copy
+  fetched by a list of its own on the drawing queue, and the copy is as every other from
+  then on. Exact whoever reads: nobody has to be known ahead.
+- **Who opens the copies** (the log names the instruction and its callers): writes of the
+  title's (title +0x5384ff5, +0x50e23ed: buffers it fills beside what shaders write there),
+  and refreshes of other host copies over the same title memory (`Shadow::copy` from a
+  flush: a window a draw reads vertices through, where a shader wrote them through the
+  buffer's copy). The second kind is the card talking to itself by way of the PC.
+
+What is left of the 69 MB, and what each needs:
+
+1. Copies in views of the title's page pool (0xac6160000+0x3200000 alone 10 MB a frame, and
+   most of 0xae.., 0xaf..): the guards there set and lift protections of their own; the
+   owner's pages have to be theirs to leave alone.
+2. Buffers the title writes in part (0xac6160000: 164 pieces sent up, 112 others fetched;
+   0x963410000): an owner by piece of 64 KiB, not by copy.
+3. A reader that is another host copy: the bytes from the card's copy by a copy on the
+   card (as `texture::alias` does for a view in another format), or one host buffer for both.
+4. The pages opened before the bytes are in them: memory of ours for the title (the
+   allocator's blocks) can be a section with a view of our own to fill it through.
+
 ## What the translated shaders are made of (2026-11-26)
 
 The title's own containers are written down as it uses them:
@@ -358,12 +402,10 @@ half for 60 frames a second, and all three stand at about 30 ms now).
    (the heaps' records are asked for that way already): the write watch asked once a call
    (4.7 ms in 15 askings now), the refreshes flushed once (8.3 ms in 30 flushes, 9,400 of
    10,600 spans copying nothing).
-3. **What goes back to the PC's memory, 69 MB a frame, 19 ms of the landing threads.**
-   43 MB of it is of copies nothing is ever sent up to. Memory with an owner: what only
-   shaders write stays the card's, its pages kept from the CPU, and is fetched when
-   something touches it (`VICTORY_ALLOC_KEPT` is the detector; the fetch at the fault is
-   what is missing, and the landing path that brings the 20 MB buffer down is not the
-   relay's `relay_card_back` loop, where the first skip was put: 0 pieces left there).
+3. **What goes back to the PC's memory, 69 MB a frame**: 9 ms of the preparing thread,
+   1.7 of the card's, all of the landing's. Memory with an owner does half of it exactly
+   (`VICTORY_CARD_OWNED=1`, above); the four things listed there are the other half, and
+   then it can be the default.
 
 Smaller: outdoor flicker (one indirect record that uses up its list's budget:
 `VICTORY_INDIRECT_REST=0`); stalls while pipelines are made (`victory warm`); the PC's
