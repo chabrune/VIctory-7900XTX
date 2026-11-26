@@ -3077,8 +3077,14 @@ fn joins_asked() -> (usize, usize) {
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+    unjoinable(ahead, next).is_none()
+}
+
+/// [`joinable`], with what stands against it: a step of `next` done on the
+/// CPU (true), or memory that `ahead` writes (false).
+pub(crate) fn unjoinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> Option<bool> {
     if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
-        return false;
+        return Some(true);
     }
     let ahead: Vec<&HostList> = ahead.collect();
     let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
@@ -3089,7 +3095,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    blocked_by(&joined, next, false).map(|_| false)
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.

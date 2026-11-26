@@ -482,22 +482,36 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    REFUSED[0].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    REFUSED[1].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                let why = if count >= most {
+                    Some(2)
+                } else if lists.1.len() + runs.len() > most_lists {
+                    Some(3)
+                } else {
+                    crate::host::unjoinable(hosts(), &runs).map(|step| if step { 4 } else { 5 })
+                };
+                if let Some(why) = why {
+                    REFUSED[why].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Lists(..) => {
+                REFUSED[6].fetch_add(1, Relaxed);
+                return Err(next);
+            }
+            Job::Present(..) => return Err(next),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -604,6 +618,12 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
 static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Why a part was not prepared together with the one before it
+/// ([`Job::take_along`]): a wait for a memory value not known to be met, a
+/// wait for a fence, as many parts as may be joined, as many lists, a step of
+/// the part done on the CPU, memory the parts before it write, another kind of
+/// entry.
+static REFUSED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -855,6 +875,17 @@ pub(super) fn line(frames: f64) {
         s[DRAINS] / frames,
         s[FORCED] / frames,
         s[JOINED] / frames
+    );
+    let r: Vec<f64> = REFUSED.iter().map(|r| r.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "parts not prepared with the one before them, per frame, by what stood between: a wait for a memory value {:.1}, a wait          for a fence {:.1}, as many parts as are joined (VICTORY_JOIN_PARTS) {:.1}, as many lists (VICTORY_JOIN_LISTS) {:.1}, a step          done on the CPU (a copy of title memory, code of ours) {:.1}, memory the parts before write {:.1}, another entry {:.1}",
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6]
     );
 }
 
