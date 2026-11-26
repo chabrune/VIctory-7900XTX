@@ -83,7 +83,10 @@ static TABLE: Mutex<BTreeMap<usize, (usize, std::sync::Weak<Shadow>)>> = Mutex::
 static COUNT: AtomicU64 = AtomicU64::new(0);
 /// Since the start: taken, turned down, opened by the title, opened by code
 /// of ours (or let go); and the bytes owned now.
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// A block of view memory, as the guards have it.
+const BLOCK: usize = 64 << 10;
 /// Who opened the first copies: the copy's start and bytes, the instruction,
 /// 0 a read / 1 a write / 2 no fault (the kernel, a release), whether in a
 /// copy of ours, the thread, and the first addresses of our own code on the
@@ -166,6 +169,11 @@ impl Pager {
     /// drawing queue has run: where they are, until the pager is used again.
     fn fetch(&mut self, host: &Host, shadow: &Shadow) -> Option<*const u8> {
         let (_, len) = shadow.span();
+        self.fetch_part(host, shadow, 0, len)
+    }
+
+    /// [`Pager::fetch`] for `len` bytes of the copy from offset `at`.
+    fn fetch_part(&mut self, host: &Host, shadow: &Shadow, at: u64, len: u64) -> Option<*const u8> {
         let (buffer, data, size) = self.buffer.as_ref()?;
         if *size < len {
             return None;
@@ -177,7 +185,7 @@ impl Pager {
         unsafe {
             allocator.Reset().ok()?;
             list.Reset(allocator, None).ok()?;
-            list.CopyBufferRegion(buffer, 0, &shadow.buffer, 0, len);
+            list.CopyBufferRegion(buffer, 0, &shadow.buffer, at, len);
             list.Close().ok()?;
             let lists = [Some(list.cast::<ID3D12CommandList>().ok()?)];
             host.queue.ExecuteCommandLists(&lists);
@@ -366,6 +374,9 @@ pub(crate) fn fault(at: usize, kind: u8, site: usize, ours: bool, stack: usize) 
     if COUNT.load(Relaxed) == 0 {
         return false;
     }
+    // Another view of the pages of a block that is the card's alone: the
+    // block the copy has.
+    let at = if crate::watch::card_block(at) { crate::watch::card_primary(at / BLOCK) * BLOCK + at % BLOCK } else { at };
     let began = std::time::Instant::now();
     loop {
         let found = {
@@ -376,8 +387,15 @@ pub(crate) fn fault(at: usize, kind: u8, site: usize, ours: bool, stack: usize) 
             }
         };
         match found {
-            None => return false,
-            Some(Some(shadow)) => return settle(&shadow, Some((site, kind, ours, stack))),
+            // (A block of the card's whose copy is gone: given back as it is.)
+            None => return crate::watch::card_block(at) && crate::watch::card_give(at / BLOCK),
+            Some(Some(shadow)) => {
+                if crate::watch::card_block(at) {
+                    return open_block(&shadow, at, Some((site, kind, ours, stack)));
+                }
+                return settle(&shadow, Some((site, kind, ours, stack)));
+            }
+            Some(None) if crate::watch::card_block(at) => return crate::watch::card_give(at / BLOCK),
             // Being released: whoever does that opens it ([`dropped`]).
             Some(None) => {
                 if began.elapsed().as_secs() >= 10 {
@@ -393,6 +411,18 @@ pub(crate) fn fault(at: usize, kind: u8, site: usize, ours: bool, stack: usize) 
 /// the title, or to be let go: copies there that are the card's alone are
 /// brought down first.
 pub(crate) fn opening(at: usize, len: usize) {
+    // Blocks of view memory that are the card's alone, each brought down.
+    for block in crate::watch::card_blocks_in(at, at.saturating_add(len)) {
+        let block = crate::watch::card_primary(block);
+        match copy_at(block * BLOCK) {
+            Some(shadow) => {
+                open_block(&shadow, block * BLOCK, None);
+            }
+            None => {
+                crate::watch::card_give(block);
+            }
+        }
+    }
     if COUNT.load(Relaxed) == 0 {
         return;
     }
@@ -413,11 +443,219 @@ pub(crate) fn dropped(shadow: &Shadow) {
     }
 }
 
+/// Blocks asked about for the card, and those of them brought up to date
+/// with nothing left to settle; since the start.
+static ASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The copy in the table whose pages hold `at`, if it is alive.
+fn copy_at(at: usize) -> Option<Arc<Shadow>> {
+    let table = table();
+    match table.range(..=at).next_back() {
+        Some((_, (end, shadow))) if at < *end => shadow.upgrade(),
+        _ => None,
+    }
+}
+
+/// In view memory, block by block: asked for the ranges a submission's
+/// shaders are declared to write of `shadow`, by the thread that prepares it.
+/// The 64 KiB blocks that lie whole in such a range, were never asked about,
+/// are shown at no other address and that nothing wrote since the copy took
+/// them become the card's alone, 64 a submission at most. A buffer the title
+/// writes in part keeps the blocks it writes: the first write of one opens
+/// it, and it is not asked about again.
+pub(super) fn claim_blocks(host: &Host, shadow: &Arc<Shadow>, ranges: &[(usize, usize)]) {
+    if !shadow.ownable_by_block(least()) {
+        return;
+    }
+    let blocks = shadow.unasked_blocks(ranges, 64);
+    if blocks.is_empty() {
+        return;
+    }
+    ASKED[0].fetch_add(blocks.len() as u64, Relaxed);
+    {
+        let mut pager = PAGER.lock().unwrap_or_else(|e| e.into_inner());
+        if pager.is_none() {
+            *pager = Pager::make(host);
+        }
+        if !pager.as_mut().is_some_and(|pager| pager.room(host, BLOCK as u64)) {
+            return;
+        }
+    }
+    // Each as the title has it: the refresh leaves it read-only and clean by
+    // the guards' hand, and what the title wrote under shader writes is put in.
+    let mut ready = Vec::with_capacity(blocks.len());
+    for &block in &blocks {
+        shadow.update(block * BLOCK, BLOCK);
+        let mut runs = 4096;
+        if !shadow.merge_under_writes(block * BLOCK, BLOCK, &mut runs) {
+            ready.push(block);
+        }
+    }
+    ASKED[1].fetch_add(ready.len() as u64, Relaxed);
+    // No read of ours of the copy's memory goes on while they are closed.
+    shadow.seal(true);
+    let waiting = std::time::Instant::now();
+    while shadow.readers() != 0 && waiting.elapsed().as_millis() < 200 {
+        std::thread::yield_now();
+    }
+    let mut taken = 0;
+    if shadow.readers() == 0 {
+        for &block in &ready {
+            taken += u32::from(crate::watch::card_take(block));
+        }
+    }
+    if taken > 0 {
+        shadow.blocks_taken(taken);
+        let (first, bytes) = shadow.pages();
+        let mut table = table();
+        if !table.contains_key(&first) {
+            table.insert(first, (first + bytes, Arc::downgrade(shadow)));
+            COUNT.fetch_add(1, Relaxed);
+        }
+        STATS[5].fetch_add(u64::from(taken), Relaxed);
+    }
+    shadow.seal(false);
+}
+
+/// The block's bytes put into its pages through a view of our own of them,
+/// so that the title reads the block whole or not at all. Whether that was
+/// done (else the caller copies them once the block is open).
+fn fill_view(address: usize, from: *const u8) -> bool {
+    let Some((section, offset)) = crate::inplace::section_of(address) else {
+        return false;
+    };
+    // SAFETY: a section of the runtime's, alive while its views are told of;
+    // a view of one block of it of our own, written whole and let go.
+    unsafe {
+        let view = mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, BLOCK);
+        if view.Value.is_null() {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(from, view.Value.cast::<u8>(), BLOCK);
+        mem::UnmapViewOfFile(view);
+    }
+    true
+}
+
+/// Brings down the block of `shadow` that holds `at` and opens it; nothing
+/// to do if it is open by now. The access that led here can be tried again.
+fn open_block(shadow: &Shadow, at: usize, who: Option<Who>) -> bool {
+    let block = at / BLOCK;
+    let host = super::host();
+    // No submission planned meanwhile, if that can be had.
+    let _planning = host.and_then(|host| {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        loop {
+            match host.submitted.try_lock() {
+                Ok(held) => break Some(held),
+                Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= until {
+                        break None;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+    });
+    let mut pager = PAGER.lock().unwrap_or_else(|e| e.into_inner());
+    if !crate::watch::card_block(at) {
+        return true;
+    }
+    let (start, len) = shadow.span();
+    let (start, end) = (start as usize, (start + len) as usize);
+    let address = block * BLOCK;
+    if address < start || address + BLOCK > end {
+        // Not a block of this copy's: given back as it is.
+        return crate::watch::card_give(block);
+    }
+    let fetched = host.zip(pager.as_mut()).and_then(|(host, pager)| pager.fetch_part(host, shadow, (address - start) as u64, BLOCK as u64));
+    let through = fetched.is_some_and(|from| fill_view(address, from));
+    crate::watch::card_give(block);
+    if let Some(from) = fetched {
+        // SAFETY: a block's bytes in the pager's buffer, held until the
+        // pager is let go; the block lies in the copy and is open.
+        unsafe { shadow.block_opened(address - start, from, BLOCK, !through) };
+    }
+    shadow.block_given();
+    STATS[6].fetch_add(1, Relaxed);
+    let (site, kind, ours, stack) = who.unwrap_or((0, 2, true, 0));
+    let mut openers = OPENERS.lock().unwrap_or_else(|e| e.into_inner());
+    if openers.len() < 24 {
+        // SAFETY: no arguments.
+        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        openers.push((address as u64, BLOCK as u64, site, kind, ours, thread, if ours { callers(stack) } else { [0; 5] }));
+    }
+    true
+}
+
+/// A copy that had blocks asked about is released: those still the card's
+/// are brought down first, and the table forgets the copy.
+pub(crate) fn dropped_blocks(shadow: &Shadow) {
+    let (start, len) = shadow.span();
+    for block in crate::watch::card_blocks_in(start as usize, (start + len) as usize) {
+        open_block(shadow, block * BLOCK, None);
+    }
+    let (first, _) = shadow.pages();
+    if shadow.owner().load(Relaxed) == FREE && table().remove(&first).is_some() {
+        COUNT.fetch_sub(1, Relaxed);
+    }
+}
+
+/// The runtime mapped a view at `[at, at + len)`: a block that is the card's
+/// alone at another view of the same pages is brought down, since they can
+/// be read through this one from now on.
+pub(crate) fn view_mapped(at: usize, len: usize) {
+    if crate::watch::card_none() {
+        return;
+    }
+    for k in 0..len.div_ceil(BLOCK) {
+        let page = at + k * BLOCK;
+        for other in crate::inplace::pages_of(page) {
+            if other != page && crate::watch::card_block(other) {
+                opening(other, BLOCK);
+            }
+        }
+    }
+}
+
+/// `[at, at + len)` of title memory is gone: blocks there that were the
+/// card's alone are nobody's, with nothing brought down.
+pub(crate) fn forgetting(at: usize, len: usize) {
+    for block in crate::watch::card_blocks_in(at, at.saturating_add(len)) {
+        if crate::watch::card_give(block) {
+            if let Some(shadow) = copy_at(block * BLOCK) {
+                shadow.block_given();
+            }
+            STATS[6].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// A landing left `pieces` pieces of 64 KiB on the card: in blocks that are
+/// the card's alone.
+pub(super) fn left(pieces: u64) {
+    STATS[7].fetch_add(pieces, Relaxed);
+}
+
 /// The line of it, while it is on.
 pub(super) fn line() {
     if !on() {
         return;
     }
+    tracing::info!(
+        "blocks of 64 KiB of view memory that are the card's alone (VICTORY_CARD_OWNED=1): since the start {} asked about, {} of them up to date, {} taken, {} brought down again; {} pieces left on the card and not fetched; not taken: {} not read-only by the guards' hand, {} not clean, {} with a view that could not be closed, {} left alone, {} shown at more than eight addresses or none",
+        ASKED[0].load(Relaxed),
+        ASKED[1].load(Relaxed),
+        STATS[5].load(Relaxed),
+        STATS[6].load(Relaxed),
+        STATS[7].load(Relaxed),
+        crate::watch::CARD_REFUSED[0].load(Relaxed),
+        crate::watch::CARD_REFUSED[1].load(Relaxed),
+        crate::watch::CARD_REFUSED[2].load(Relaxed),
+        crate::watch::CARD_REFUSED[3].load(Relaxed),
+        crate::watch::CARD_REFUSED[4].load(Relaxed)
+    );
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Relaxed)).collect();
     let named = |site: usize| -> String {
         use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW};

@@ -549,6 +549,18 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+    // And a block that is the card's alone at another view of these pages
+    // is brought down: they can be read through this one from now on.
+    crate::host::owner::view_mapped(at, len);
+}
+
+/// The section a title view shows at `page` and where in it; `None` if
+/// `page` is in no view the runtime told of.
+pub(crate) fn section_of(page: usize) -> Option<(usize, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=page).next_back()?;
+    let within = page.wrapping_sub(base);
+    (within < bytes).then_some((section, offset + within as u64))
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):

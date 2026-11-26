@@ -1141,6 +1141,193 @@ static PUBLISHED: Bits = Bits::new();
 /// no view.
 static PROTECTED: Bits = Bits::new();
 
+/// The blocks of view memory that are the card's alone (`crate::host::owner`):
+/// not to be read or written (`PAGE_NOACCESS`) by the owner's hand, set and
+/// cleared under the guards' lock. The guards leave them as they are and
+/// tell them as written at every asking: who reads one faults, and the fault
+/// is where its bytes are brought down.
+static CARD: Bits = Bits::new();
+/// How many there are.
+static CARD_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether no block is the card's alone.
+pub(crate) fn card_none() -> bool {
+    CARD_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) == 0
+}
+
+/// Whether the block that holds `at` is the card's alone.
+pub(crate) fn card_block(at: usize) -> bool {
+    CARD_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) != 0 && CARD.any(at / BLOCK, at / BLOCK + 1)
+}
+
+/// Whether a block of `[from, to)` is.
+pub(crate) fn card_any(from: usize, to: usize) -> bool {
+    from < to && CARD_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) != 0 && CARD.any(from / BLOCK, to.div_ceil(BLOCK))
+}
+
+/// Whether every block of `[from, to)` is.
+pub(crate) fn card_all(from: usize, to: usize) -> bool {
+    from < to
+        && CARD_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && (from / BLOCK..to.div_ceil(BLOCK)).all(|block| CARD.any(block, block + 1))
+}
+
+/// The blocks of `[from, to)` that are, by number.
+pub(crate) fn card_blocks_in(from: usize, to: usize) -> Vec<usize> {
+    if !card_any(from, to) {
+        return Vec::new();
+    }
+    (from / BLOCK..to.div_ceil(BLOCK)).filter(|&block| CARD.any(block, block + 1)).collect()
+}
+
+/// The parts of `[from, to)` that lie in no such block, added to `out`.
+pub(crate) fn card_gaps(from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+    let mut run: Option<usize> = None;
+    for block in from / BLOCK..to.div_ceil(BLOCK) {
+        match (CARD.any(block, block + 1), run) {
+            (false, None) => run = Some((block * BLOCK).max(from)),
+            (true, Some(a)) => {
+                out.push((a, block * BLOCK));
+                run = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(a) = run {
+        out.push((a, to));
+    }
+}
+
+/// The other views of the pages of blocks that are the card's alone, by the
+/// block the copy has (its own view), and that block by each of the others.
+static CARD_VIEWS: Mutex<(BTreeMap<usize, Vec<usize>>, BTreeMap<usize, usize>)> = Mutex::new((BTreeMap::new(), BTreeMap::new()));
+
+/// The block a copy has whose pages `block` shows too, if `block` is another
+/// view of a block that is the card's alone; else `block`.
+pub(crate) fn card_primary(block: usize) -> usize {
+    if card_none() {
+        return block;
+    }
+    CARD_VIEWS.lock().unwrap_or_else(|e| e.into_inner()).1.get(&block).copied().unwrap_or(block)
+}
+
+/// Takes `block` for the card: a block of view memory that a copy has just
+/// taken (read-only by our hand and clean: nothing wrote it since, through
+/// this view or another of its pages) is no longer the guards' and can be
+/// neither read nor written, at any view of its pages. Whether it was taken.
+pub(crate) fn card_take(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
+    let views: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|at| at / BLOCK).collect();
+    let mut g = guards();
+    let why = if !g.protected.contains(block) {
+        Some(0)
+    } else if !g.clean.contains(block) {
+        Some(1)
+    } else if g.left_alone(block) || views.iter().any(|&v| BESIDE.any(v, v + 1) || g.left_alone(v)) {
+        Some(3)
+    } else if views.is_empty() || views.len() > 8 || !views.contains(&block) {
+        Some(4)
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        CARD_REFUSED[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    // Every view of the pages, or none: a view left open would be a way
+    // around the others.
+    let mut closed: Vec<(usize, u32)> = Vec::with_capacity(views.len());
+    let mut all = true;
+    for &view in &views {
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        let done = unsafe { VirtualProtect((view * BLOCK) as *const _, BLOCK, PAGE_NOACCESS, &mut old) } != 0;
+        if done {
+            closed.push((view, old));
+        }
+        // (Read-only by the guards' hand, as the copy's own view is; another
+        // protection is not what they left, and a view that is not there
+        // cannot be closed.)
+        if !done || old != PAGE_READONLY {
+            all = false;
+            break;
+        }
+    }
+    if !all {
+        for (view, old) in closed {
+            let mut was = 0;
+            // SAFETY: as above: back to what it was.
+            unsafe { VirtualProtect((view * BLOCK) as *const _, BLOCK, old, &mut was) };
+        }
+        CARD_REFUSED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    for &view in &views {
+        CARD.set(view);
+        g.protected.remove(view);
+        g.clean.remove(view);
+        g.aliased.remove(view);
+        PUBLISHED.clear(view);
+        PROTECTED.clear(view);
+    }
+    CARD_BLOCKS.fetch_add(views.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let others: Vec<usize> = views.into_iter().filter(|&v| v != block).collect();
+    if !others.is_empty() {
+        let mut known = CARD_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        for &other in &others {
+            known.1.insert(other, block);
+        }
+        known.0.insert(block, others);
+    }
+    true
+}
+
+/// Why blocks were not taken for the card, since the start: not read-only by
+/// the guards' hand, not clean, read-only together with other views, left
+/// alone or written beside its guard, shown at several addresses or none.
+pub(crate) static CARD_REFUSED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Gives `block` back, a block a copy has (or another view of its pages):
+/// every view of them can be read and written again, and is written as far
+/// as the guards know (no copy has what is in it now). Whether it was the
+/// card's.
+pub(crate) fn card_give(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect};
+    let _g = guards();
+    if !CARD.any(block, block + 1) {
+        return false;
+    }
+    let mut views = vec![block];
+    {
+        let mut known = CARD_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let primary = known.1.get(&block).copied().unwrap_or(block);
+        if primary != block {
+            views = vec![primary];
+        }
+        if let Some(others) = known.0.remove(&primary) {
+            for other in &others {
+                known.1.remove(other);
+            }
+            views.extend(others);
+        }
+    }
+    for view in views {
+        if !CARD.take(view) {
+            continue;
+        }
+        CARD_BLOCKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut old = 0;
+        // SAFETY: a block the owner closed; only its protection changes. (If
+        // other memory is at the address by now, it keeps what it has.)
+        unsafe {
+            if VirtualProtect((view * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 && old != PAGE_NOACCESS {
+                VirtualProtect((view * BLOCK) as *const _, BLOCK, old, &mut old);
+            }
+        }
+    }
+    true
+}
+
 /// The blocks the title's bytes were put in beside their guards
 /// ([`put_beside`]) and that no asking has told as written since. Such a
 /// block is as it was else: read-only, clean, and an asking that finds its
@@ -1911,7 +2098,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if cover(&mut g, block, block + 1) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) && !CARD.any(block, block + 1) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             protect(&mut g, from, to);
@@ -2034,6 +2221,10 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 /// took it, [`open`] would have opened it. Whether it is read-only now.
 fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    // (The card's alone: not ours to make read-only.)
+    if CARD.any(block, block + 1) {
+        return false;
+    }
     g.aliased.insert(block);
     if g.protected.contains(block) {
         return true;
@@ -2660,6 +2851,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // (What was the card's alone there is nobody's now.)
+    crate::host::owner::forgetting(at, len);
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2850,6 +3043,17 @@ pub(crate) fn install() {
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+        }
+        // Taken for the card while this fault waited for the guards.
+        if crate::host::owner::fault(
+            at,
+            WRITE as u8,
+            r.ExceptionAddress as usize,
+            ours.is_some(),
+            // SAFETY: the context the system passes.
+            unsafe { (*context).Rsp } as usize,
+        ) {
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
             return EXCEPTION_CONTINUE_EXECUTION;

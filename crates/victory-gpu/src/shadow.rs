@@ -110,6 +110,12 @@ pub(crate) struct Shadow {
     /// How many of our threads are reading the copy's title memory now
     /// ([`Shadow::reading`]): the card takes the copy when none is.
     readers: std::sync::atomic::AtomicU32,
+    /// How many 64 KiB blocks of the copy's title memory are the card's
+    /// alone (`crate::watch::card_block`), which blocks were asked about
+    /// (never twice), and whether some are being taken right now.
+    owned_blocks: std::sync::atomic::AtomicU32,
+    asked_blocks: Mutex<Vec<u64>>,
+    sealing: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2710,17 +2716,26 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 /// ([`Shadow::reading`]).
 struct Reading<'a>(&'a Shadow);
 
+thread_local! {
+    /// How many reads of title memory ([`Shadow::reading`]) the thread is in.
+    static READING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl Drop for Reading<'_> {
     fn drop(&mut self) {
+        READING.set(READING.get().saturating_sub(1));
         self.0.readers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        // The card's alone: brought down before its buffer goes.
+        // The card's alone, or blocks of it: brought down before its buffer goes.
         if self.owned.load(Ordering::Relaxed) == crate::host::owner::OWNED {
             crate::host::owner::dropped(self);
+        }
+        if !self.asked_blocks.get_mut().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            crate::host::owner::dropped_blocks(self);
         }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
@@ -3225,12 +3240,132 @@ impl Shadow {
     /// (the taking waits for the readers it finds, and a reader looks at
     /// the state after it has counted itself).
     fn reading(&self) -> Option<Reading<'_>> {
-        self.readers.fetch_add(1, Ordering::SeqCst);
-        if matches!(self.owned.load(Ordering::SeqCst), crate::host::owner::OWNED | crate::host::owner::FETCHING | crate::host::owner::SEALING) {
+        loop {
+            self.readers.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.owned.load(Ordering::SeqCst), crate::host::owner::OWNED | crate::host::owner::FETCHING | crate::host::owner::SEALING) {
+                self.readers.fetch_sub(1, Ordering::SeqCst);
+                return None;
+            }
+            // Blocks of the copy are being taken (`Shadow::seal`): when that
+            // is done, unless this is a read inside a read that began before.
+            if !self.sealing.load(Ordering::SeqCst) || READING.get() != 0 {
+                READING.set(READING.get() + 1);
+                return Some(Reading(self));
+            }
             self.readers.fetch_sub(1, Ordering::SeqCst);
+            while self.sealing.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// The parts of `[from, to)` (title memory, in the copy) outside the
+    /// blocks that are the card's alone; `None` if there is no such block
+    /// there (nearly always).
+    fn free_parts(&self, from: usize, to: usize) -> Option<Vec<(usize, usize)>> {
+        if self.owned_blocks.load(Ordering::Relaxed) == 0 || !crate::watch::card_any(from, to) {
             return None;
         }
-        Some(Reading(self))
+        let mut parts = Vec::new();
+        crate::watch::card_gaps(from, to, &mut parts);
+        Some(parts)
+    }
+
+    /// `ranges` without the blocks that are the card's alone.
+    fn busy_free(&self, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        if self.owned_blocks.load(Ordering::Relaxed) == 0 {
+            return ranges;
+        }
+        let mut parts = Vec::new();
+        for (a, e) in ranges {
+            crate::watch::card_gaps(a, e, &mut parts);
+        }
+        parts
+    }
+
+    /// Whether blocks of the copy may become the card's alone one by one:
+    /// a title buffer of `least` bytes and more with a side in the card's
+    /// memory, in view memory the guards watch.
+    pub(crate) fn ownable_by_block(&self, least: u64) -> bool {
+        self.card.is_some()
+            && self.place.is_none()
+            && !self.window
+            && !self.mapped
+            && self.len >= least
+            && self.watched.load(Ordering::Relaxed) == GUARDED
+            && self.owned.load(Ordering::Relaxed) == crate::host::owner::FREE
+    }
+
+    /// The 64 KiB blocks (by number) that lie whole in one of `ranges` and in
+    /// the copy and were never asked about, `most` at most: asked now.
+    pub(crate) fn unasked_blocks(&self, ranges: &[(usize, usize)], most: usize) -> Vec<usize> {
+        const BLOCK: usize = 64 << 10;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / BLOCK;
+        let mut asked = self.asked_blocks.lock().unwrap_or_else(|e| e.into_inner());
+        if asked.is_empty() {
+            asked.resize((end.div_ceil(BLOCK) - base).div_ceil(64).max(1), 0);
+        }
+        let mut blocks = Vec::new();
+        for &(from, to) in ranges {
+            for block in from.max(start).div_ceil(BLOCK)..to.min(end) / BLOCK {
+                let i = block - base;
+                if asked[i / 64] >> (i % 64) & 1 == 0 {
+                    asked[i / 64] |= 1 << (i % 64);
+                    blocks.push(block);
+                    if blocks.len() >= most {
+                        return blocks;
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    /// Blocks of the copy are about to be taken for the card, or that is
+    /// over: no read of ours of its title memory begins meanwhile.
+    pub(crate) fn seal(&self, on: bool) {
+        self.sealing.store(on, Ordering::SeqCst);
+    }
+
+    /// `n` blocks of the copy became the card's alone.
+    pub(crate) fn blocks_taken(&self, n: u32) {
+        self.owned_blocks.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// One was given back.
+    pub(crate) fn block_given(&self) {
+        let _ = self.owned_blocks.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
+    /// Whether any is.
+    pub(crate) fn has_card_blocks(&self) -> bool {
+        self.owned_blocks.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether offsets `[lo, hi)` of the copy lie in blocks that are the
+    /// card's alone, all of them: nothing of it is fetched.
+    pub(crate) fn piece_card(&self, lo: usize, hi: usize) -> bool {
+        self.owned_blocks.load(Ordering::Relaxed) != 0 && crate::watch::card_all(self.start as usize + lo, self.start as usize + hi)
+    }
+
+    /// `len` bytes at offset `at` of the copy as the card held them (`from`)
+    /// go into the CPU's side, and into title memory if `title` (they are
+    /// there already if they were put in through a view of ours); noted as a
+    /// landing's, which the next refresh compares and sends nothing of.
+    ///
+    /// # Safety
+    /// `from` holds `len` bytes; the offsets lie in the copy; with `title`
+    /// the title's pages there can be written.
+    pub(crate) unsafe fn block_opened(&self, at: usize, from: *const u8, len: usize, title: bool) {
+        // SAFETY: the caller's; the CPU's side holds the copy's bytes.
+        unsafe {
+            if title {
+                std::ptr::copy_nonoverlapping(from, (self.start as usize + at) as *mut u8, len);
+            }
+            std::ptr::copy_nonoverlapping(from, self.data.add(at), len);
+        }
+        self.note_landing(at, at + len);
     }
 
     /// How many are reading it now.
@@ -3380,6 +3515,9 @@ impl Shadow {
             owned: AtomicU8::new(0),
             owner_asked: Default::default(),
             readers: Default::default(),
+            owned_blocks: Default::default(),
+            asked_blocks: Mutex::default(),
+            sealing: Default::default(),
         }
     }
 
@@ -3848,6 +3986,8 @@ impl Shadow {
             .filter(|&&(a, e)| a < to && e > from)
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
+        // (Not in blocks that are the card's alone: the title wrote nothing there.)
+        let busy = self.busy_free(busy);
         if busy.is_empty() {
             return false;
         }
@@ -3895,6 +4035,8 @@ impl Shadow {
             .filter(|&&(a, e)| a < to && e > from)
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
+        // (Not in blocks that are the card's alone: the title wrote nothing there.)
+        let busy = self.busy_free(busy);
         if busy.is_empty() {
             return false;
         }
@@ -4436,6 +4578,9 @@ impl Shadow {
         let Some(_reading) = self.reading() else {
             return 0;
         };
+        if let Some(parts) = self.free_parts(from, to) {
+            return parts.into_iter().map(|(a, e)| self.take_landed(a, e)).sum();
+        }
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -4500,6 +4645,10 @@ impl Shadow {
         let Some(_reading) = self.reading() else {
             return 0;
         };
+        // (Nor the blocks of it that are: each part between them.)
+        if let Some(parts) = self.free_parts(from, to) {
+            return parts.into_iter().map(|(a, e)| self.take(a, e, known)).sum();
+        }
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -4555,6 +4704,10 @@ impl Shadow {
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        // (Nor the blocks of it that are: each part between them.)
+        if let Some(parts) = self.free_parts(from, to) {
+            return parts.into_iter().map(|(a, e)| self.copy(a, e)).sum();
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {

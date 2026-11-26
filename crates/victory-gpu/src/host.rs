@@ -4432,10 +4432,12 @@ impl Host {
         // the card's alone (`owner`): before what changed is gathered, so
         // that what the taking brings up goes with this submission.
         if owner::on() {
-            for (shadow, _) in declared {
+            for (shadow, ranges) in declared {
                 if shadow.owner_unasked() {
                     owner::claim(self, shadow);
                 }
+                // In view memory, block by block (the title writes some).
+                owner::claim_blocks(self, shadow, ranges);
             }
         }
         // The ranges this submission's shaders may write, per copy.
@@ -4885,6 +4887,11 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        // In blocks that are the card's alone: left there.
+                        if r.shadow.piece_card(lo, hi) {
+                            owner::left(1);
+                            continue;
+                        }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
