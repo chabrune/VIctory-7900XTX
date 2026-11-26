@@ -76,6 +76,10 @@ if ($Console -eq 'series-s') {
     # -More @{VICTORY_PORT_CBV='0'; VICTORY_CARD_OWNED='0'}: as before.
     $settings.VICTORY_PORT_CBV = '1'
     $settings.VICTORY_CARD_OWNED = '1'
+    # The title's anisotropic samplers (it asks 2, 4, 8 and 16 samples) take 16: sharper
+    # ground and walls seen at an angle, at no frame rate cost here (34 fps, the card 26.6 ms
+    # a frame, with and without). -More @{VICTORY_ANISOTROPY='0'}: what the title asks.
+    $settings.VICTORY_ANISOTROPY = '16'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 

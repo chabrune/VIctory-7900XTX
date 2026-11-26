@@ -65,11 +65,7 @@ impl Fields {
                 self.bias
                     .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
             },
-            MaxAnisotropy: if aniso {
-                self.anisotropy.clamp(1, 16)
-            } else {
-                1
-            },
+            MaxAnisotropy: if aniso { anisotropy(self.anisotropy) } else { 1 },
             ComparisonFunc: if reduction == 1 {
                 D3D12_COMPARISON_FUNC(self.compare as i32)
             } else {
@@ -79,6 +75,28 @@ impl Fields {
             MinLOD: min_lod,
             MaxLOD: max_lod,
         }
+    }
+}
+
+/// How many samples an anisotropic sampler that asks for `asked` takes:
+/// what it asks (1 to 16), or `VICTORY_ANISOTROPY=<2 to 16>` if that is more
+/// and the sampler asks for 2 at least. Only for samplers the title made
+/// anisotropic with a ratio: a bilinear one, or one of ratio 1, stays what
+/// it is (tables and screen passes read through those). The title asks 2, 4,
+/// 8 and 16 here; a PC's card filters 16 for next to nothing (an RX 7700 XT,
+/// run q1-af16: 34 fps and the card 26.6 ms a frame, as without). Said once
+/// for each ratio the title asks.
+pub(crate) fn anisotropy(asked: u32) -> u32 {
+    static MOST: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| std::env::var("VICTORY_ANISOTROPY").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (2..=16).contains(n)));
+    let asked = asked.clamp(1, 16);
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_or(1 << asked, std::sync::atomic::Ordering::Relaxed) & (1 << asked) == 0 {
+        tracing::info!(asked, most = ?most, "an anisotropic sampler of the title's (VICTORY_ANISOTROPY=<2..16>: at least that many samples)");
+    }
+    match most {
+        Some(most) if asked >= 2 => asked.max(most),
+        _ => asked,
     }
 }
 

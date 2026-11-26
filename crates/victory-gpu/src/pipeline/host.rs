@@ -582,7 +582,12 @@ impl HostPipeline {
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
                     MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
+                    // (An anisotropic one takes `VICTORY_ANISOTROPY` samples at least.)
+                    MaxAnisotropy: if s.filter_for_host(aniso_point_mip_supported) & 0x40 != 0 {
+                        crate::sampler::anisotropy(s.max_anisotropy)
+                    } else {
+                        s.max_anisotropy
+                    },
                     ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
                     BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
                     MinLOD: s.min_lod,
