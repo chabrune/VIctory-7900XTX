@@ -166,6 +166,12 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Lists of ours made since the start, and how often one that rested without
+/// a host list was given one (`super::lazy_backs`).
+static BACKS_MADE: AtomicU64 = AtomicU64::new(0);
+static BACKS_FILLED: AtomicU64 = AtomicU64::new(0);
+/// Recordings of a reset and a close alone, which took no list of ours.
+static EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -238,6 +244,26 @@ impl Recording {
                     return;
                 };
                 if inner.back == 0 {
+                    // Nothing but a reset and a close: a list the title made
+                    // or reset and closed, as it keeps those it has no use
+                    // for now. It takes no list of ours (`super::lazy_backs`),
+                    // and a submission that names it runs nothing for it.
+                    if super::lazy_backs()
+                        && inner.chunks.is_empty()
+                        && chunk.len() == 3
+                        && chunk[0] == RESET | 1 << 16
+                        && chunk[2] == CLOSE
+                    {
+                        inner.closed = true;
+                        inner.scheduled = false;
+                        self.done.store(true, Release);
+                        self.moved.notify_all();
+                        drop(inner);
+                        give_back(vec![chunk]);
+                        EMPTY.fetch_add(1, Relaxed);
+                        crate::queue::line_moved();
+                        return;
+                    }
                     inner.back = back_list(self.kind) as usize;
                 }
                 (chunk, inner.back as This)
@@ -291,10 +317,24 @@ fn give_back(streams: Vec<Vec<u64>>) {
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
-        unsafe { (*(back as *mut List)).kind = kind };
+        let list = unsafe { &mut *(back as *mut List) };
+        list.kind = kind;
+        // The submission of its last recording took its host list
+        // (`super::lazy_backs`): it has one again from here, closed, as the
+        // reset its stream begins with wants it.
+        if list.host.is_none()
+            && let Some(fresh) = super::fresh_list()
+        {
+            fresh.close();
+            list.host = Some(fresh);
+            BACKS_FILLED.fetch_add(1, Relaxed);
+        }
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    BACKS_MADE.fetch_add(1, Relaxed);
+    let mut list = super::boxed(kind, std::ptr::null(), false);
+    list.ours = true;
+    let list: This = Box::into_raw(list).cast_const().cast();
     super::close(list);
     list
 }
@@ -349,13 +389,28 @@ pub(crate) fn line(frames: f64) {
         return;
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    // Where the host lists are: with the lists of ours nobody uses, and with
+    // those that recordings still hold (a recording keeps its list until the
+    // title resets the list it was written from).
+    let (resting, resting_with_host) = {
+        let backs = held(&BACKS);
+        // SAFETY: lists of ours nobody uses, looked at under their lock.
+        let with_host = backs.iter().filter(|&&b| unsafe { (*(b as *const List)).host.is_some() }).count();
+        (backs.len(), with_host)
+    };
     tracing::info!(
-        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
+        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}; lists of ours: {} made, {} of them rest ({} with a host list), {} given a host list again and {} recordings of a reset and a close alone that took none so far (VICTORY_LAZY_BACKS); host lists idle: {}",
         s[0],
         s[1] / 1000.0,
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
-        s[3]
+        s[3],
+        BACKS_MADE.load(Relaxed),
+        resting,
+        resting_with_host,
+        BACKS_FILLED.load(Relaxed),
+        EMPTY.load(Relaxed),
+        super::idle_lists()
     );
 }
 

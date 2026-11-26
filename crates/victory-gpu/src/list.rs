@@ -134,6 +134,10 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
+    /// A list of ours that the translating threads record into ([`thin`]'s
+    /// back lists); the title never sees it ([`lazy_backs`]).
+    #[cfg(windows)]
+    ours: bool,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -240,6 +244,58 @@ const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 fn pools() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Whether a list of ours (a back list of [`thin`]) holds a host list only
+/// while it has work. Two things, both about host lists that did nothing:
+///
+/// - A recording that is a reset and a close and nothing else takes no list
+///   of ours at all. The title closes every list it makes and keeps those it
+///   has no use for closed; each was translated like any other, into a list
+///   of ours with a host list, and kept it until the title's next reset of
+///   that list. In the menus 627 lists of ours were made where 4 a frame
+///   record anything, 921 in the world where 216 do; about 770 of them were
+///   held by such recordings (run m2, an RX 7700 XT, 2026-11-26).
+/// - A list of ours whose submission took its host list is given another
+///   when it next records ([`thin`]'s `back_list`), not at once as a title's
+///   list must be (the title resets that next, and may at any time).
+///
+/// A host list is 1.15 MB of the process's private memory on that driver the
+/// moment it is made (1.22 with breadcrumbs), and releasing it gives none of
+/// it back (measured with 64 lists on a device of their own): what counts is
+/// how many there ever are at once.
+/// `VICTORY_LAZY_BACKS=0`: every recording has a list with a host list, as
+/// before.
+#[cfg(windows)]
+fn lazy_backs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_BACKS").is_none_or(|v| v != "0"))
+}
+
+/// The host side of a submitted list, taken from it. A title's list is left
+/// a new, closed host list for its next reset (a new one is open, and the
+/// reset wants it closed); a list of ours none ([`lazy_backs`]). `None` if
+/// it has no host side, or there is no new one to leave.
+///
+/// # Safety
+/// `list` is one of our lists, closed and submitted: nothing records into
+/// it until it is reset.
+#[cfg(windows)]
+unsafe fn take_host(list: *mut List) -> Option<crate::host::HostList> {
+    // SAFETY: the caller's.
+    let list = unsafe { &mut *list };
+    if list.ours && lazy_backs() {
+        return list.host.take();
+    }
+    let fresh = fresh_list()?;
+    fresh.close();
+    list.host.replace(fresh)
+}
+
+/// Host lists that wait to be used again, for the log.
+#[cfg(windows)]
+fn idle_lists() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len()
 }
 
 /// A host list open for recording: one that has run, as a title's list is
@@ -397,18 +453,13 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = (unsafe { take_host(this.cast_mut().cast::<List>()) }) else {
             continue;
         };
+        // SAFETY: as above.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -469,17 +520,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_host(list) else {
                 continue;
             };
             let uploads =
@@ -619,6 +664,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
+        #[cfg(windows)]
+        ours: false,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
