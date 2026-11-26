@@ -331,6 +331,42 @@ fn block_class(size: usize) -> usize {
     }
 }
 
+/// How many blocks were asked for since the last line, by the power of two
+/// their size is under (up to 2^31 and more): made, then made over at
+/// another size (by the new size).
+static ASKED: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+#[inline]
+fn asked(size: usize, again: bool) {
+    let power = (usize::BITS - size.leading_zeros()).min(31) as usize;
+    ASKED[2 * power + usize::from(again)].fetch_add(1, Relaxed);
+}
+
+/// The line of [`ASKED`], per frame.
+fn asked_line(frames: f64) {
+    let n: Vec<u64> = ASKED.iter().map(|a| a.swap(0, Relaxed)).collect();
+    let (made, again): (u64, u64) = (n.iter().step_by(2).sum(), n.iter().skip(1).step_by(2).sum());
+    let by: Vec<String> = (0..32)
+        .filter(|&p| n[2 * p] + n[2 * p + 1] > 0)
+        .map(|p| {
+            let under = 1u64 << p;
+            let unit = if under >= 1 << 20 { format!("{} MiB", under >> 20) } else if under >= 1 << 10 { format!("{} KiB", under >> 10) } else { format!("{under} B") };
+            format!("under {unit}: {:.0} and {:.0}", n[2 * p] as f64 / frames, n[2 * p + 1] as f64 / frames)
+        })
+        .collect();
+    let (keeping, found, system) = crate::heap::line();
+    tracing::info!(
+        "blocks asked of the heap by our own code per frame, all threads: {:.0} made and {:.0} made over at another size; of those of a megabyte and less, \
+         {:.0} were blocks kept by their thread's holder and {:.0} the system's ({}); by size (made and made over): {}",
+        made as f64 / frames,
+        again as f64 / frames,
+        found as f64 / frames,
+        system as f64 / frames,
+        if keeping { "VICTORY_HEAP=system: none kept" } else { "none kept: VICTORY_HEAP=system" },
+        by.join("; ")
+    );
+}
+
 fn own(size: usize, made: bool) {
     let class = block_class(size);
     let own = &OWN[bank()].0;
@@ -388,8 +424,9 @@ struct Counting;
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let at = unsafe { crate::heap::Heap.alloc(layout) };
         if !at.is_null() {
+            asked(layout.size(), false);
             own(layout.size(), true);
             big(at, layout.size(), true);
         }
@@ -398,8 +435,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let at = unsafe { crate::heap::Heap.alloc_zeroed(layout) };
         if !at.is_null() {
+            asked(layout.size(), false);
             own(layout.size(), true);
             big(at, layout.size(), true);
         }
@@ -410,13 +448,14 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         own(layout.size(), false);
         big(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
-        unsafe { std::alloc::System.dealloc(at, layout) };
+        unsafe { crate::heap::Heap.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = unsafe { crate::heap::Heap.realloc(at, layout, size) };
         if !moved.is_null() {
+            asked(size, true);
             own(layout.size(), false);
             own(size, true);
             big(at, layout.size(), false);
@@ -1173,6 +1212,7 @@ pub(crate) fn log(frames: f64) {
     let c: Vec<f64> = (0..COUNTERS).map(|i| taken(i) as f64 / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    asked_line(frames);
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
