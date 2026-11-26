@@ -5113,6 +5113,81 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     });
 }
 
+/// Diagnostics (`VICTORY_OVERLAPS=1`): the host copies that hold the same
+/// title memory as another, said once a minute. On the console a byte is in
+/// one place; a shader that writes it through one copy and one that reads it
+/// through another meet here only by way of the PC's memory (fetched, put
+/// into title memory, found written, sent up).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn overlaps_line() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_OVERLAPS").is_some_and(|v| v == "1")) {
+        return;
+    }
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms().max(1);
+    let said = SAID.load(Ordering::Relaxed);
+    if said != 0 && now < said + 60_000 {
+        return;
+    }
+    SAID.store(now, Ordering::Relaxed);
+    // Start, end, whether shaders write it, whether a window, whether in the
+    // card's memory.
+    let mut all: Vec<(u64, u64, bool, bool, bool)> = Vec::new();
+    for (key, entry) in buffers_read().iter() {
+        if let Some(shadow) = &entry.shadow {
+            all.push((key.0, entry.end, shadow.written(), false, shadow.card.is_some()));
+        }
+    }
+    for (key, shadow) in LOOSE.read().unwrap_or_else(|e| e.into_inner()).iter() {
+        all.push((key.0, key.0 + key.1, shadow.written(), true, shadow.card.is_some()));
+    }
+    all.sort_unstable();
+    // Each copy against those that begin before its end.
+    let mut pairs: Vec<(u64, usize, usize)> = Vec::new();
+    let (mut shared, mut with_written) = (0u64, 0u64);
+    for i in 0..all.len() {
+        let mut most = 0;
+        let mut j = i + 1;
+        while j < all.len() && all[j].0 < all[i].1 {
+            let bytes = all[i].1.min(all[j].1) - all[j].0;
+            if bytes > 0 {
+                pairs.push((bytes, i, j));
+                most = most.max(bytes);
+                if all[i].2 || all[j].2 {
+                    with_written += bytes;
+                }
+            }
+            j += 1;
+            if j - i > 4096 {
+                break;
+            }
+        }
+        shared += most;
+    }
+    pairs.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let kind = |c: &(u64, u64, bool, bool, bool)| {
+        format!(
+            "{:#x}+{:#x} ({}{}{})",
+            c.0,
+            c.1 - c.0,
+            if c.3 { "window" } else { "buffer" },
+            if c.2 { ", shaders write it" } else { "" },
+            if c.4 { ", on the card" } else { "" }
+        )
+    };
+    let told: Vec<String> =
+        pairs.iter().take(16).map(|&(bytes, i, j)| format!("{} KiB of {} and {}", bytes >> 10, kind(&all[i]), kind(&all[j]))).collect();
+    tracing::info!(
+        "host copies that hold the same title memory as another: {} pairs among {} copies, {} MB of them where shaders write one of the two, {} MB counted once a copy; the largest: {}",
+        pairs.len(),
+        all.len(),
+        with_written >> 20,
+        shared >> 20,
+        told.join("; ")
+    );
+}
+
 fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }

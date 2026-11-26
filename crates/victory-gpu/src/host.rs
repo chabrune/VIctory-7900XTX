@@ -3669,6 +3669,8 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     crate::port::log(frames);
     crate::inplace::blocks_line();
+    #[cfg(feature = "diagnostics")]
+    crate::shadow::overlaps_line();
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -4454,7 +4456,20 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
+        // `VICTORY_CARD_NO_BACK=1` (a measurement, not a way to run: what
+        // shaders write to copies in the card's memory is then neither
+        // compared nor fetched, and the title's memory never has it): what
+        // the compares and the fetches cost the card and the landing.
+        // `VICTORY_CARD_NO_BACK=<KiB>` over 1: only for copies of that many
+        // KiB and more (which copies' bytes are wanted back at all).
+        static NO_BACK: OnceLock<u64> = OnceLock::new();
+        let no_back_from = *NO_BACK.get_or_init(|| match std::env::var("VICTORY_CARD_NO_BACK").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            None | Some(0) => u64::MAX,
+            Some(1) => 0,
+            Some(kib) => kib << 10,
+        });
+        let no_back = no_back_from == 0;
+        for (shadow, ranges) in declared.iter().filter(|(shadow, _)| shadow.span().1 < no_back_from) {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4483,7 +4498,7 @@ impl Host {
                 }
             }
         }
-        for (shadow, from, len) in looked {
+        for (shadow, from, len) in looked.iter().filter(|_| !no_back) {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
