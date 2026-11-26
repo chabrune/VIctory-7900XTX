@@ -252,8 +252,15 @@ pub(super) fn claim(host: &Host, shadow: &Arc<Shadow>) -> bool {
     // buffer) has its own bytes on the card: what shaders write through
     // that one would never reach this one, nor the other way (run j2: a
     // window's refresh brought 72 blocks of such a copy down again).
-    if (start..start + len).step_by(BLOCK).any(|at| crate::shadow::copies_holding(at) > 1) {
-        return down("another copy holds the same memory");
+    // (One that no shader writes only reads it: its refresh brings this
+    // one down, as any read does. When shaders are first declared to write
+    // such a copy, what it overlaps is brought down: `written_first`.)
+    let written_beside = |shadow: &Arc<Shadow>| {
+        let (start, len) = shadow.span();
+        (start..start + len).step_by(BLOCK).any(|at| crate::shadow::copies_at(at).iter().any(|copy| !Arc::ptr_eq(copy, shadow) && copy.written()))
+    };
+    if written_beside(shadow) {
+        return down("another copy that shaders write holds the same memory");
     }
     {
         let mut pager = PAGER.lock().unwrap_or_else(|e| e.into_inner());
@@ -400,14 +407,14 @@ pub(crate) fn fault(at: usize, kind: u8, site: usize, ours: bool, stack: usize) 
         };
         match found {
             // (A block of the card's whose copy is gone: given back as it is.)
-            None => return crate::watch::card_block(at) && crate::watch::card_give(at / BLOCK),
+            None => return crate::watch::card_block(at) && give(at / BLOCK),
             Some(Some(shadow)) => {
                 if crate::watch::card_block(at) {
                     return open_block(&shadow, at, Some((site, kind, ours, stack)));
                 }
                 return settle(&shadow, Some((site, kind, ours, stack)));
             }
-            Some(None) if crate::watch::card_block(at) => return crate::watch::card_give(at / BLOCK),
+            Some(None) if crate::watch::card_block(at) => return give(at / BLOCK),
             // Being released: whoever does that opens it ([`dropped`]).
             Some(None) => {
                 if began.elapsed().as_secs() >= 10 {
@@ -431,7 +438,7 @@ pub(crate) fn opening(at: usize, len: usize) {
                 open_block(&shadow, block * BLOCK, None);
             }
             None => {
-                crate::watch::card_give(block);
+                give(block);
             }
         }
     }
@@ -515,7 +522,7 @@ pub(super) fn claim_blocks(host: &Host, shadow: &Arc<Shadow>, ranges: &[(usize, 
     let mut taken = 0;
     if shadow.readers() == 0 {
         for &block in &ready {
-            taken += u32::from(crate::watch::card_take(block));
+            taken += u32::from(take(host, shadow, block));
         }
     }
     // Diagnostics: the first askings that took less than they asked for.
@@ -550,6 +557,218 @@ pub(super) fn claim_blocks(host: &Host, shadow: &Arc<Shadow>, ranges: &[(usize, 
         STATS[5].fetch_add(u64::from(taken), Relaxed);
     }
     shadow.seal(false);
+    // (See `take`: not while the copy is sealed.)
+    let again = std::mem::take(&mut *REOPEN.lock().unwrap_or_else(|e| e.into_inner()));
+    for block in again {
+        open_block(shadow, block * BLOCK, None);
+    }
+}
+
+/// The copies whose pages show the tile of a block that is the card's alone,
+/// by the block the taker has: each with its page (`super::pages`).
+static BORROWS: Mutex<BTreeMap<usize, Vec<(std::sync::Weak<Shadow>, u32)>>> = Mutex::new(BTreeMap::new());
+
+/// Since the start, with `super::pages`: blocks taken that other copies
+/// hold too; those copies' pages shown the taker's tile; given their own
+/// again; and blocks not taken because the taker's card side is not made of
+/// pages or the block not on a page line of it, a holder's is not, a
+/// holder's block is not on a page line, a submission in the air writes a
+/// holder's, reads of a holder's did not end.
+static SHARED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Diagnostics: shared blocks not taken, by whether they were guarded when
+/// the taking began and just before the closing (no/no, no/yes, yes/no,
+/// yes/yes).
+#[cfg(feature = "diagnostics")]
+static GUARDED_AT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Blocks taken while a copy that only read them was declared written: to be
+/// brought down again once the taking is over ([`claim_blocks`]).
+static REOPEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Low half: blocks asked about that were the card's already by way of
+/// another copy. High half: blocks brought down because shaders were first
+/// declared to write a copy that did not share them.
+static SHARED_ALREADY: AtomicU64 = AtomicU64::new(0);
+
+/// Takes `block` of `shadow` for the card ([`crate::watch::card_take`]).
+/// Where other copies hold the block's pages (the title shows them at
+/// several addresses and has buffers at each, or two copies lie at one),
+/// only with `super::pages`, and if each of them can show the taker's tile
+/// in the page: they do from here on, so that what shaders write through
+/// one of them is what the others read, as in the console's one memory.
+fn take(host: &Host, shadow: &Arc<Shadow>, block: usize) -> bool {
+    // The card's already, by way of another copy of its pages (which this
+    // one shares the tile of, or would have stood in the way).
+    if crate::watch::card_block(block * BLOCK) {
+        SHARED_ALREADY.fetch_add(1, Relaxed);
+        return false;
+    }
+    // Diagnostics: whether the block is guarded when the taking begins.
+    #[cfg(feature = "diagnostics")]
+    let guarded_first = crate::watch::guarded(block * BLOCK, (block + 1) * BLOCK);
+    let mut holders: Vec<(Arc<Shadow>, usize)> = Vec::new();
+    for view in crate::inplace::pages_of(block * BLOCK) {
+        for copy in crate::shadow::copies_at(view as u64) {
+            if !(view == block * BLOCK && Arc::ptr_eq(&copy, shadow)) {
+                holders.push((copy, view));
+            }
+        }
+    }
+    if holders.is_empty() || !super::pages::on() {
+        return crate::watch::card_take(block, false);
+    }
+    let Ok(mine) = shadow.page_to_share(block * BLOCK, true) else {
+        SHARED[3].fetch_add(1, Relaxed);
+        return false;
+    };
+    // The holders that share the tile, with their pages; and those that
+    // cannot (a window outside buffers, a copy that begins off the page
+    // lines): no matter while no shader writes them, since their reads of
+    // the block bring it down as any read does.
+    let mut pages = Vec::with_capacity(holders.len());
+    let mut readers: Vec<Arc<Shadow>> = Vec::new();
+    for (copy, view) in &holders {
+        match copy.page_to_share(*view, false) {
+            Ok(page) => pages.push((copy.clone(), page)),
+            Err(3) => {
+                // (Its flight lands soon: asked again then.)
+                SHARED[6].fetch_add(1, Relaxed);
+                shadow.unask_block(block);
+                return false;
+            }
+            Err(_) if !copy.written() => readers.push(copy.clone()),
+            Err(why) => {
+                SHARED[3 + usize::from(why.clamp(1, 2))].fetch_add(1, Relaxed);
+                return false;
+            }
+        }
+    }
+    // No read of ours of their memory goes on while the block is closed and
+    // their pages change hands.
+    if pages.is_empty() {
+        // (Only copies that read hold it beside this one.)
+        let taken = crate::watch::card_take(block, true);
+        if taken && readers.iter().any(|copy| copy.written()) {
+            REOPEN.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+        }
+        return taken;
+    }
+    for (copy, _) in &holders {
+        copy.seal(true);
+    }
+    let waiting = std::time::Instant::now();
+    while holders.iter().any(|(copy, _)| copy.readers() != 0) && waiting.elapsed().as_millis() < 50 {
+        std::thread::yield_now();
+    }
+    let still = holders.iter().any(|(copy, _)| copy.readers() != 0);
+    if still {
+        SHARED[7].fetch_add(1, Relaxed);
+        shadow.unask_block(block);
+    }
+    #[cfg(feature = "diagnostics")]
+    let guarded_then = crate::watch::guarded(block * BLOCK, (block + 1) * BLOCK);
+    let taken = !still && crate::watch::card_take(block, true);
+    #[cfg(feature = "diagnostics")]
+    if !taken {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        GUARDED_AT[usize::from(guarded_first) * 2 + usize::from(guarded_then)].fetch_add(1, Relaxed);
+        if SAID.fetch_add(1, Relaxed) < 12 {
+            let (start, len) = shadow.span();
+            let held: Vec<String> = holders.iter().map(|(copy, view)| format!("{:#x}+{:#x} at {view:#x}", copy.span().0, copy.span().1)).collect();
+            tracing::info!(
+                "a block several copies hold not taken: {:#x} of {start:#x}+{len:#x}, guarded when the taking began {guarded_first}, before the closing {guarded_then}, waited {} us for the holders; held by {}",
+                block * BLOCK,
+                waiting.elapsed().as_micros(),
+                held.join(", ")
+            );
+        }
+    }
+    if taken {
+        let mut lent = Vec::with_capacity(pages.len());
+        for (copy, page) in &pages {
+            if copy.share_page(host, *page, shadow, mine) {
+                lent.push((Arc::downgrade(copy), *page));
+                SHARED[1].fetch_add(1, Relaxed);
+            }
+        }
+        BORROWS.lock().unwrap_or_else(|e| e.into_inner()).insert(block, lent);
+        SHARED[0].fetch_add(1, Relaxed);
+    }
+    for (copy, _) in &holders {
+        copy.seal(false);
+    }
+    // One of those that only read was declared written meanwhile
+    // (`written_first` looked at the block before it was the card's): the
+    // block comes down again.
+    if taken && readers.iter().any(|copy| copy.written()) {
+        REOPEN.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    }
+    taken
+}
+
+/// Shaders are declared to write `shadow` for the first time. What is the
+/// card's alone in its memory by way of another copy, and is not shared
+/// with it page by page, is brought down: what it writes there would never
+/// reach the copy that has it (the taking let it be as a copy that only
+/// reads).
+pub(crate) fn written_first(shadow: &Shadow) {
+    if !on() || crate::watch::card_none() && COUNT.load(Relaxed) == 0 {
+        return;
+    }
+    let (start, len) = shadow.span();
+    let me = std::ptr::from_ref(shadow);
+    for block in crate::watch::card_blocks_in(start as usize, (start + len) as usize) {
+        let primary = crate::watch::card_primary(block);
+        let owner = copy_at(primary * BLOCK);
+        let mine = owner.as_ref().is_some_and(|o| std::ptr::eq(Arc::as_ptr(o), me));
+        let shares = BORROWS.lock().unwrap_or_else(|e| e.into_inner()).get(&primary).is_some_and(|lent| lent.iter().any(|(copy, _)| std::ptr::eq(copy.as_ptr(), me)));
+        if mine || shares {
+            continue;
+        }
+        SHARED_ALREADY.fetch_add(1 << 32, Relaxed);
+        match owner {
+            Some(owner) => {
+                open_block(&owner, primary * BLOCK, None);
+            }
+            None => {
+                give(primary);
+            }
+        }
+    }
+    if COUNT.load(Relaxed) == 0 {
+        return;
+    }
+    let there: Vec<Arc<Shadow>> = {
+        let table = table();
+        let (from, to) = (start as usize, (start + len) as usize);
+        table.iter().filter(|(first, (end, _))| **first < to && from < *end).filter_map(|(_, (_, other))| other.upgrade()).collect()
+    };
+    for other in there {
+        if !std::ptr::eq(Arc::as_ptr(&other), me) {
+            settle(&other, None);
+        }
+    }
+}
+
+/// Gives `block` back ([`crate::watch::card_give`]: a block a copy has, or
+/// another view of its pages), and the copies whose pages showed its tile
+/// show their own again.
+fn give(block: usize) -> bool {
+    let primary = crate::watch::card_primary(block);
+    let given = crate::watch::card_give(block);
+    let lent = BORROWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&primary);
+    if let Some(lent) = lent
+        && let Some(host) = super::host()
+    {
+        for (copy, page) in lent {
+            if let Some(copy) = copy.upgrade() {
+                copy.unshare_page(host, page);
+                SHARED[2].fetch_add(1, Relaxed);
+            }
+        }
+    }
+    given
 }
 
 /// The block's bytes put into its pages through a view of our own of them,
@@ -602,11 +821,11 @@ fn open_block(shadow: &Shadow, at: usize, who: Option<Who>) -> bool {
     let address = block * BLOCK;
     if address < start || address + BLOCK > end {
         // Not a block of this copy's: given back as it is.
-        return crate::watch::card_give(block);
+        return give(block);
     }
     let fetched = host.zip(pager.as_mut()).and_then(|(host, pager)| pager.fetch_part(host, shadow, (address - start) as u64, BLOCK as u64));
     let through = fetched.is_some_and(|from| fill_view(address, from));
-    crate::watch::card_give(block);
+    give(block);
     if let Some(from) = fetched {
         // SAFETY: a block's bytes in the pager's buffer, held until the
         // pager is let go; the block lies in the copy and is open.
@@ -666,7 +885,7 @@ pub(crate) fn view_mapped(at: usize, len: usize) {
 /// card's alone are nobody's, with nothing brought down.
 pub(crate) fn forgetting(at: usize, len: usize) {
     for block in crate::watch::card_blocks_in(at, at.saturating_add(len)) {
-        if crate::watch::card_give(block) {
+        if give(block) {
             if let Some(shadow) = copy_at(block * BLOCK) {
                 shadow.block_given();
             }
@@ -688,6 +907,10 @@ pub(super) fn written_elsewhere(shadow: &Arc<Shadow>, from: usize, to: usize) {
         let primary = crate::watch::card_primary(block);
         let owner = copy_at(primary * BLOCK);
         if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, shadow)) {
+            continue;
+        }
+        // (Or shares its tile: what it writes is the taker's too.)
+        if BORROWS.lock().unwrap_or_else(|e| e.into_inner()).get(&primary).is_some_and(|lent| lent.iter().any(|(copy, _)| std::ptr::eq(copy.as_ptr(), Arc::as_ptr(shadow)))) {
             continue;
         }
         ELSEWHERE.0.fetch_add(1, Relaxed);
@@ -745,11 +968,25 @@ pub(super) fn line() {
             &views[8..]
         );
     }
+    if super::pages::on() {
+        let s: Vec<u64> = SHARED.iter().map(|s| s.load(Relaxed)).collect();
+        tracing::info!(
+            "blocks that several copies hold, since the start (VICTORY_CARD_PAGES=1): {} taken for the card, {} pages of the other copies shown the taker's tile, {} given their own again; not taken: {} the taker's card side not made of pages or the block not on a page line of it, {} a holder shaders write is not made of pages, {} or does not have it on a page line, {} written by a submission in the air through a holder, {} a holder read meanwhile; {} asked about were the card's already by another copy, {} brought down when shaders were first declared to write a copy that did not share them",
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+            SHARED_ALREADY.load(Relaxed) & 0xffff_ffff,
+            SHARED_ALREADY.load(Relaxed) >> 32
+        );
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(
+            "shared blocks not taken at the closing, by whether guarded when the taking began and before the closing (no/no, no/yes, yes/no, yes/yes): {:?}",
+            GUARDED_AT.iter().map(|g| g.load(Relaxed)).collect::<Vec<_>>()
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let pairs: Vec<String> = ELSEWHERE.1.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(ws, wl, os, ol)| format!("{ws:#x}+{wl:#x} writes blocks {os:#x}+{ol:#x} has")).collect();
         tracing::info!(
-            "blocks shaders were declared to write through one copy while another had them for the card, since the last line: {}; pairs so far: {}",
+            "blocks shaders were declared to write through one copy while another had them for the card and did not share them, since the last line: {}; pairs so far: {}",
             ELSEWHERE.0.swap(0, Relaxed),
             pairs.join("; ")
         );

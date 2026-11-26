@@ -495,6 +495,29 @@ console; when the block is brought down, they get their own tiles and the bytes 
 Then every block shaders write can be the card's alone, and nothing of it is compared,
 fetched or sent up.
 
+Done the same day (`crates/victory-gpu/src/host/pages.rs`, `VICTORY_CARD_PAGES=1`, on in
+the Series S profile). A title buffer's copy that begins on a 64 KiB line has a reserved
+buffer for its card side, every page a tile of its own from a pool of 64 MiB heaps (139
+copies, 326 MB, 2 ms of `UpdateTileMappings` in all). When the owner takes a block that
+other copies hold, each of them that shaders write must be able to show the taker's tile
+in that page, and does from the lists sent after it on; a holder with a write of a
+submission in the air there puts the taking off until it has landed; a holder no shader
+writes (a window outside buffers) is left as it is, since its read of the block brings
+it down as any read does, and the first write declared for such a copy brings down what
+it does not share (`owner::written_first`). Brought down, the others show their own
+tiles again and send the page up whole. Opening cutscene, the clock at 60 Hz:
+
+| | fps | compared a frame | fetched | sent up | blocks taken / brought down |
+|---|---|---|---|---|---|
+| blocks with other copies not taken (exact) | 33-34 | 5,400 pieces | 35 MB | 18 MB | 1,390 / 75 |
+| taken through one copy (not exact, `VICTORY_CARD_SHARED=1`) | 34.5-35 | 4,100 | 25 MB | 8.8 MB | 3,010 / 1,210 |
+| the copies share the tile (exact) | 35.3-36.3 | 1,050 | 11.6 MB | 3.3 MB | 2,940 / 220 |
+
+The log counts the blocks shaders are declared to write through a copy that neither has
+them nor shares them: 620 a frame in the second row, none in the third. What is still
+compared is private memory (the title's general allocator) under copies that begin off
+the 64 KiB lines.
+
 ## The other repositories, compared
 
 Read up to 2026-11-25: Marvisak/VIctory, fxceless/victory-fork, DexNom/VIctory,

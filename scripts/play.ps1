@@ -88,6 +88,15 @@ if ($Console -eq 'series-s') {
     # VICTORY_PORT_JOURNAL='0'}: as before.
     $settings.VICTORY_PORT_GUARD = '1'
     $settings.VICTORY_PORT_JOURNAL = '1'
+    # The copies of one page share the card's memory (crates/victory-gpu/src/host/pages.rs): the
+    # title shows a page of its memory at several addresses and has buffers at each, and what
+    # shaders write through one copy is the others' at once, as on the console, where the block
+    # is the card's alone (VICTORY_CARD_OWNED). RX 7700 XT, opening cutscene, the clock at 60 Hz
+    # (2026-11-26): 35.3-36.3 fps against 33-34 without, 1,050 pieces compared on the card a
+    # frame against 5,400, 11.6 MB fetched against 35, 3.3 MB sent up against 18; no block
+    # written through a copy that does not share it (the log's line says how many).
+    # -More @{VICTORY_CARD_PAGES='0'}: as before.
+    $settings.VICTORY_CARD_PAGES = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 

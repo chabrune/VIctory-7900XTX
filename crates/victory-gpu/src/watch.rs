@@ -1924,7 +1924,7 @@ pub(crate) fn card_primary(block: usize) -> usize {
 /// taken (read-only by our hand and clean: nothing wrote it since, through
 /// this view or another of its pages) is no longer the guards' and can be
 /// neither read nor written, at any view of its pages. Whether it was taken.
-pub(crate) fn card_take(block: usize) -> bool {
+pub(crate) fn card_take(block: usize, shared_ok: bool) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
     let views: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|at| at / BLOCK).collect();
     // Whether a copy holds the page at another of its addresses (looked at
@@ -1937,7 +1937,11 @@ pub(crate) fn card_take(block: usize) -> bool {
     // memory among those copies would give: not exact).
     static ANYWAY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let anyway = *ANYWAY.get_or_init(|| std::env::var_os("VICTORY_CARD_SHARED").is_some_and(|v| v == "1"));
-    let shared = if anyway {
+    let shared = if shared_ok {
+        // (The copies at its other addresses share its tile from now on:
+        // `crate::host::owner`'s taking with `crate::host::pages`.)
+        false
+    } else if anyway {
         views.len() > 8
     } else {
         views.len() <= MANY_VIEWS && views.iter().any(|&v| crate::shadow::copies_holding((v * BLOCK) as u64) > usize::from(v == block))

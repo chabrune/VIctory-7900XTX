@@ -3366,6 +3366,101 @@ impl Shadow {
         self.sealing.store(on, Ordering::SeqCst);
     }
 
+    /// The pages of the card's side, where it is made of them
+    /// (`crate::host::pages`).
+    fn paged(&self) -> Option<&crate::host::pages::Paged> {
+        self.card.as_ref().and_then(|c| c.paged.as_ref())
+    }
+
+    /// With `crate::host::pages`: which page of the card's side the 64 KiB
+    /// block of title memory at `block` is, if it can be shown another
+    /// copy's tile or lend its own: the card's side is made of pages, the
+    /// block begins in the copy on a page line, and no submission in the air
+    /// is declared to write there (what it writes goes to this copy's own
+    /// tile, whatever the page shows after). Else why not: 1 not made of
+    /// pages, 2 not on a page line of the copy, 3 written by a submission
+    /// in the air.
+    pub(crate) fn page_to_share(&self, block: usize, taker: bool) -> Result<u32, u8> {
+        const BLOCK: usize = 64 << 10;
+        if self.paged().is_none() {
+            return Err(1);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if block < start || block >= end || !(block - start).is_multiple_of(BLOCK) {
+            return Err(2);
+        }
+        // (The taker's own tile is the one all will show: what its flights
+        // write is there. And a range only the submission being prepared
+        // declares is written by lists not sent yet.)
+        if !taker {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+            let now = PREPARED.load(Ordering::Relaxed);
+            let in_the_air = |range: &(usize, usize)| !relay() || flights.0.get(range).is_none_or(|&(count, last)| count > 1 || last != now);
+            if pending.iter().any(|range| range.0 < block + BLOCK && range.1 > block && in_the_air(range)) {
+                return Err(3);
+            }
+        }
+        Ok(((block - start) / BLOCK) as u32)
+    }
+
+    /// Page `page` of the card's side shows the tile of `of`'s page
+    /// `of_page` from the lists sent after this on: the block is the card's
+    /// alone and `of` has it. What was not sent up of the page is forgotten
+    /// (the taker has put the title's bytes in), and the page counts as one
+    /// of the copy's blocks that are the card's.
+    pub(crate) fn share_page(&self, host: &crate::host::Host, page: u32, of: &Shadow, of_page: u32) -> bool {
+        const BLOCK: usize = 64 << 10;
+        let (Some(mine), Some(theirs)) = (self.paged(), of.paged()) else {
+            return false;
+        };
+        if !mine.borrow(host, page, theirs, of_page) {
+            return false;
+        }
+        if let Some(card) = &self.card {
+            let (from, to) = (page as usize * BLOCK, (page as usize + 1) * BLOCK);
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut kept = Vec::with_capacity(dirty.len() + 1);
+            for &(a, e) in dirty.iter() {
+                if a < from {
+                    kept.push((a, e.min(from)));
+                }
+                if e > to {
+                    kept.push((a.max(to), e));
+                }
+            }
+            *dirty = kept;
+        }
+        self.blocks_taken(1);
+        true
+    }
+
+    /// Page `page` shows its own tile again (the block was brought down).
+    /// The tile holds what it held when the page was lent, without what was
+    /// not sent then: the page goes up whole with the next send, after the
+    /// refresh that follows the block's opening has put the title's bytes
+    /// into the CPU's side.
+    pub(crate) fn unshare_page(&self, host: &crate::host::Host, page: u32) {
+        const BLOCK: usize = 64 << 10;
+        if self.paged().is_some_and(|mine| mine.restore(host, page)) {
+            let size = self.card.as_ref().map_or(0, |c| c.size as usize);
+            self.card_changed(page as usize * BLOCK, ((page as usize + 1) * BLOCK).min(size));
+            self.block_given();
+        }
+    }
+
+    /// The block (by number) may be asked about again ([`Shadow::unasked_blocks`]).
+    pub(crate) fn unask_block(&self, block: usize) {
+        const BLOCK: usize = 64 << 10;
+        let base = self.start as usize / BLOCK;
+        let mut asked = self.asked_blocks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = block.checked_sub(base)
+            && let Some(word) = asked.get_mut(i / 64)
+        {
+            *word &= !(1 << (i % 64));
+        }
+    }
+
     /// `n` blocks of the copy became the card's alone.
     pub(crate) fn blocks_taken(&self, n: u32) {
         self.owned_blocks.fetch_add(n, Ordering::Relaxed);
@@ -3611,7 +3706,11 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        self.written.store(true, Ordering::Relaxed);
+        // (The first time: what another copy has for the card of this
+        // one's memory is brought down, unless this one shares it.)
+        if !self.written.swap(true, Ordering::AcqRel) {
+            crate::host::owner::written_first(self);
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -5814,6 +5913,23 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return find(address, len);
     }
     lookup(address, len, true)
+}
+
+/// The copies that hold the title memory at `address`
+/// ([`copies_holding`] counts them).
+pub(crate) fn copies_at(address: u64) -> Vec<Arc<Shadow>> {
+    let mut all: Vec<Arc<Shadow>> =
+        buffers_read().range(..=(address, usize::MAX)).rev().take(64).filter(|(_, e)| e.end > address).filter_map(|(_, e)| e.shadow.clone()).collect();
+    let from = (address & !(WINDOW - 1)).saturating_sub(WINDOW);
+    all.extend(
+        LOOSE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .range((from, 0)..=(address, u64::MAX))
+            .filter(|&(&(start, len), _)| address < start + len)
+            .map(|(_, shadow)| shadow.clone()),
+    );
+    all
 }
 
 /// How many copies hold the title memory at `address`: title buffers'
