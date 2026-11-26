@@ -4698,6 +4698,17 @@ impl Host {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             // Not the blocks that are the card's alone (`owner`): nothing of
             // them comes back, so nothing of them is compared.
+            // Diagnostics: ranges shaders are declared to write in blocks
+            // that are the card's alone by way of ANOTHER copy (a page shown
+            // at several addresses, or two copies at one): what they write
+            // there stays in this copy's bytes, and the copy that has the
+            // block never sees it.
+            #[cfg(feature = "diagnostics")]
+            if !crate::watch::card_none() {
+                for &(from, to) in &spans {
+                    owner::written_elsewhere(shadow, from, to);
+                }
+            }
             let spans = if shadow.has_card_blocks() {
                 let mut around = Vec::with_capacity(spans.len());
                 for (from, to) in spans {

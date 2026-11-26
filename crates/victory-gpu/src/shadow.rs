@@ -5787,6 +5787,20 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// How many copies hold the title memory at `address`: title buffers'
+/// (made) and windows' outside buffers. For the owner
+/// (`crate::watch::card_take`): a page with a copy at more than one of the
+/// addresses it is shown at, or two copies at one, has its bytes on the card
+/// more than once.
+pub(crate) fn copies_holding(address: u64) -> usize {
+    let buffers = buffers_read().range(..=(address, usize::MAX)).rev().take(64).filter(|(_, e)| e.end > address && e.shadow.is_some()).count();
+    // (A window is 8 MiB at most, and begins on a 4 MiB line or, a tail, in
+    // its cell.)
+    let from = (address & !(WINDOW - 1)).saturating_sub(WINDOW);
+    let windows = LOOSE.read().unwrap_or_else(|e| e.into_inner()).range((from, 0)..=(address, u64::MAX)).filter(|&(&(start, len), _)| address < start + len).count();
+    buffers + windows
+}
+
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;

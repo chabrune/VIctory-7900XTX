@@ -1927,6 +1927,21 @@ pub(crate) fn card_primary(block: usize) -> usize {
 pub(crate) fn card_take(block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
     let views: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|at| at / BLOCK).collect();
+    // Whether a copy holds the page at another of its addresses (looked at
+    // before the guards are taken: one made after this reads the block, and
+    // that brings it down).
+    // (Its own address has the copy that takes it; a second one there is
+    // as one elsewhere.)
+    // `VICTORY_CARD_SHARED=1` takes them all the same, at up to eight
+    // addresses, as until run j1 (for measuring what sharing the card's
+    // memory among those copies would give: not exact).
+    static ANYWAY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let anyway = *ANYWAY.get_or_init(|| std::env::var_os("VICTORY_CARD_SHARED").is_some_and(|v| v == "1"));
+    let shared = if anyway {
+        views.len() > 8
+    } else {
+        views.len() <= MANY_VIEWS && views.iter().any(|&v| crate::shadow::copies_holding((v * BLOCK) as u64) > usize::from(v == block))
+    };
     let g = guards();
     let why = if !g.protected.contains(block) {
         // (Why not: it rests after a write, is left alone, is not a view's,
@@ -1966,17 +1981,18 @@ pub(crate) fn card_take(block: usize) -> bool {
         Some(1)
     } else if g.left_alone(block) || views.iter().any(|&v| BESIDE.any(v, v + 1) || g.left_alone(v)) {
         Some(3)
-    } else if views.is_empty() || views.len() > 8 || !views.contains(&block) {
-        CARD_WHY[if views.is_empty() { 5 } else if views.len() > 8 { 6 } else { 7 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        CARD_VIEWS_OF[8 + views_bucket(views.len())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        {
-            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 4 || n.is_multiple_of(97) && n < 700 {
-                let shown: Vec<String> = views.iter().map(|v| format!("{:#x}", v * BLOCK)).collect();
-                tracing::info!("a block not taken for the card for its many views: {:#x}, shown at {}", block * BLOCK, shown.join(" "));
-            }
-        }
+    } else if views.is_empty() || views.len() > MANY_VIEWS || !views.contains(&block) || shared {
+        // (A page shown at several addresses may have a copy at more than
+        // one of them, each with its own bytes on the card: a shader that
+        // writes it through one and one that reads it through another meet
+        // only by way of title memory, which a block that is the card's
+        // alone keeps them from. Runs i5 to i7, 2026-11-26: such blocks were
+        // taken through one copy and brought down again by the refresh of
+        // the other, 108 blocks each way between two copies of one 24 MB of
+        // pages. Until those copies share the card's memory page by page,
+        // such a block is not taken. Every block asked about is shown at two
+        // addresses or more (run j1); most have one copy.)
+        CARD_WHY[if views.is_empty() { 5 } else if shared || views.len() > MANY_VIEWS { 6 } else { 7 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(4)
     } else {
         None
@@ -2053,7 +2069,8 @@ fn views_bucket(n: usize) -> usize {
 
 /// Diagnostics, finer than [`CARD_REFUSED`]: not read-only because the block
 /// rests after a write, is left alone, is not a view's, is absent, other; no
-/// view of its pages known, more than eight, its own not among them.
+/// view of its pages known, too many or a copy at another, its own not among
+/// them.
 pub(crate) static CARD_WHY: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// Why blocks were not taken for the card, since the start: not read-only by

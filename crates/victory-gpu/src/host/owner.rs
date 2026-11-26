@@ -248,6 +248,13 @@ pub(super) fn claim(host: &Host, shadow: &Arc<Shadow>) -> bool {
     if !private_pages(first, bytes) {
         return down("its memory is not private memory committed whole");
     }
+    // Another copy of the same memory (a window over a buffer, a buffer in a
+    // buffer) has its own bytes on the card: what shaders write through
+    // that one would never reach this one, nor the other way (run j2: a
+    // window's refresh brought 72 blocks of such a copy down again).
+    if (start..start + len).step_by(BLOCK).any(|at| crate::shadow::copies_holding(at) > 1) {
+        return down("another copy holds the same memory");
+    }
     {
         let mut pager = PAGER.lock().unwrap_or_else(|e| e.into_inner());
         if pager.is_none() {
@@ -519,7 +526,7 @@ pub(super) fn claim_blocks(host: &Host, shadow: &Arc<Shadow>, ranges: &[(usize, 
             let refused: Vec<u64> = crate::watch::CARD_REFUSED.iter().zip(&refused_before).map(|(r, b)| r.load(Relaxed) - b).collect();
             let (start, len) = shadow.span();
             tracing::info!(
-                "blocks asked for the card of {start:#x}+{len:#x}: {} asked, {} up to date, {taken} taken (readers {}); refused now: {} not read-only by the guards' hand, {} not clean, {} with a view that could not be closed, {} left alone, {} shown at more than eight addresses or none; first block {:#x}",
+                "blocks asked for the card of {start:#x}+{len:#x}: {} asked, {} up to date, {taken} taken (readers {}); refused now: {} not read-only by the guards' hand, {} not clean, {} with a view that could not be closed, {} left alone, {} shown where another copy is, at too many addresses or none; first block {:#x}",
                 blocks.len(),
                 ready.len(),
                 shadow.readers(),
@@ -668,6 +675,31 @@ pub(crate) fn forgetting(at: usize, len: usize) {
     }
 }
 
+/// Diagnostics: blocks shaders were declared to write through one copy while
+/// they were the card's alone by way of another, since the last line; and the
+/// first pairs (the writing copy, the copy that has the block).
+#[cfg(feature = "diagnostics")]
+static ELSEWHERE: (AtomicU64, Mutex<Vec<(u64, u64, u64, u64)>>) = (AtomicU64::new(0), Mutex::new(Vec::new()));
+
+/// Diagnostics: shaders are declared to write `[from, to)` of `shadow`.
+#[cfg(feature = "diagnostics")]
+pub(super) fn written_elsewhere(shadow: &Arc<Shadow>, from: usize, to: usize) {
+    for block in crate::watch::card_blocks_in(from, to) {
+        let primary = crate::watch::card_primary(block);
+        let owner = copy_at(primary * BLOCK);
+        if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, shadow)) {
+            continue;
+        }
+        ELSEWHERE.0.fetch_add(1, Relaxed);
+        let mut pairs = ELSEWHERE.1.lock().unwrap_or_else(|e| e.into_inner());
+        let (ws, wl) = shadow.span();
+        let (os, ol) = owner.map_or((0, 0), |o| o.span());
+        if pairs.len() < 12 && !pairs.iter().any(|p| p.0 == ws && p.2 == os) {
+            pairs.push((ws, wl, os, ol));
+        }
+    }
+}
+
 /// Diagnostics: the copies a compare was planned for since the last line,
 /// by the copy: what it is to the owner, the pieces compared and in how
 /// many ranges.
@@ -703,7 +735,7 @@ pub(super) fn line() {
     {
         let why: Vec<u64> = crate::watch::CARD_WHY.iter().map(|w| w.load(Relaxed)).collect();
         tracing::info!(
-            "blocks not taken for the card, since the start, finer: not read-only: {} resting after a write, {} left alone, {} not a view's, {} absent, {} others; views of the pages: {} none known, {} more than eight, {} its own not among them",
+            "blocks not taken for the card, since the start, finer: not read-only: {} resting after a write, {} left alone, {} not a view's, {} absent, {} others; views of the pages: {} none known, {} too many or with a copy at another, {} its own not among them",
             why[0], why[1], why[2], why[3], why[4], why[5], why[6], why[7]
         );
         let views: Vec<u64> = crate::watch::CARD_VIEWS_OF.iter().map(|w| w.load(Relaxed)).collect();
@@ -711,6 +743,15 @@ pub(super) fn line() {
             "blocks not taken for the card by how many addresses show their pages (0, 1, 2-8, 9-16, 17-64, 65-256, 257-1024, more): not read-only {:?}; many views {:?}",
             &views[..8],
             &views[8..]
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let pairs: Vec<String> = ELSEWHERE.1.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(ws, wl, os, ol)| format!("{ws:#x}+{wl:#x} writes blocks {os:#x}+{ol:#x} has")).collect();
+        tracing::info!(
+            "blocks shaders were declared to write through one copy while another had them for the card, since the last line: {}; pairs so far: {}",
+            ELSEWHERE.0.swap(0, Relaxed),
+            pairs.join("; ")
         );
     }
     #[cfg(feature = "diagnostics")]
@@ -726,7 +767,7 @@ pub(super) fn line() {
         );
     }
     tracing::info!(
-        "blocks of 64 KiB of view memory that are the card's alone (VICTORY_CARD_OWNED=1): since the start {} asked about, {} of them up to date, {} taken, {} brought down again; {} pieces left on the card and not fetched; not taken: {} not read-only by the guards' hand, {} not clean, {} with a view that could not be closed, {} left alone, {} shown at more than eight addresses or none",
+        "blocks of 64 KiB of view memory that are the card's alone (VICTORY_CARD_OWNED=1): since the start {} asked about, {} of them up to date, {} taken, {} brought down again; {} pieces left on the card and not fetched; not taken: {} not read-only by the guards' hand, {} not clean, {} with a view that could not be closed, {} left alone, {} shown where another copy is, at too many addresses or none",
         ASKED[0].load(Relaxed),
         ASKED[1].load(Relaxed),
         STATS[5].load(Relaxed),
