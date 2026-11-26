@@ -1651,7 +1651,7 @@ pub(crate) fn port_guard_line(frames: f64) {
     let q: Vec<u64> = QUIET_COUNTS.iter().enumerate().map(|(i, c)| if i < 3 { c.swap(0, Relaxed) } else { c.load(Relaxed) }).collect();
     if q[3] != 0 {
         tracing::info!(
-            "private title memory left to the guards (VICTORY_QUIET_GUARD=1): {} ranges, {} MB, since the start; per frame {:.1} kernel askings \
+            "private memory left to the guards (VICTORY_QUIET_GUARD=1): {} ranges, {} MB, since the start; per frame {:.1} kernel askings \
              for {:.1} blocks the guards found written, {:.1} pages of 4 KiB written in them",
             q[3],
             (q[4] * BLOCK as u64) >> 20,
@@ -1670,8 +1670,8 @@ pub(crate) fn port_guard_line(frames: f64) {
 /// find it no view ([`is_view`]) and say the range is not watched.
 static VIEWS: Bits = Bits::new();
 
-/// Blocks of private title memory that are left to the guards ([`quiet`]),
-/// as view memory is.
+/// Blocks of private memory (the kernel write-watches it) that are left to
+/// the guards ([`quiet`]), as view memory is.
 static QUIET: Bits = Bits::new();
 
 /// Since the last frame line, for [`QUIET`] memory: kernel askings made for
@@ -1686,19 +1686,23 @@ thread_local! {
     static QUIET_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether large ranges of private title memory that are refreshed whole
-/// are left to the guards (`VICTORY_QUIET_GUARD=1`, with renderer port #6
-/// and the light refreshes; off by default).
+/// Whether large ranges of private memory that are refreshed whole and
+/// written little are left to the guards (`VICTORY_QUIET_GUARD=1`, with
+/// renderer port #6 and the light refreshes; off by default).
 ///
 /// Private memory is write-watched by the kernel, and an asking walks the
-/// page tables of all it asks about. The title's pool-wide buffers over its
-/// 64 MiB chunks are refreshed whole by every list that comes to memory by
-/// address (`crate::memory`): with ray tracing some twenty of them by each
-/// of the four submissions a frame that trace or build, 4.9 GB of page
-/// tables walked a frame to hear that a handful of pages were written
-/// (run rt-trace3: 618 askings over 6,724 MB in 8.9 ms a frame against 229
-/// over 1,485 MB in 2.9 without ray tracing, all on the submitting thread's
-/// way), and as many megabytes looked at by the refreshes.
+/// page tables of all it asks about. The 64 MiB arenas of memory by address
+/// (`crate::memory`) are refreshed whole by every list that comes to it:
+/// with ray tracing twenty of them by each of the three or four submissions
+/// a frame that trace or build, 4.9 GB of page tables walked a frame to
+/// hear that a handful of pages were written (run rt-trace3: 618 askings
+/// over 6,724 MB in 8.9 ms a frame against 229 over 1,485 MB in 2.9 without
+/// ray tracing, on the submitting thread's way).
+///
+/// Not for memory the title writes much: its 4 MiB buffers that memory by
+/// address finds pages in had 68 to 82 of their 1,500 blocks written a
+/// frame, each a fault of the title's and two changes of protection
+/// (run rt-quiet: 300 faults a frame against 227).
 fn quiet_on() -> bool {
     #[cfg(test)]
     if QUIET_IN_TEST.get() {
@@ -1708,19 +1712,20 @@ fn quiet_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUIET_GUARD").is_some_and(|v| v == "1")) && port_guard() && light()
 }
 
-/// Leaves the private title memory `[start, end)` to the guards from now
-/// on ([`quiet_on`]): its blocks are made read-only at its next asking and
+/// Leaves the private memory `[start, end)` to the guards from now on
+/// ([`quiet_on`]): its blocks are made read-only at its next asking and
 /// known unwritten by their bits after, with no word of the kernel's; a
-/// write of the title's faults once a block, as in view memory. Nothing is
-/// told less exactly than before: of the blocks the guards find written
-/// the kernel is asked, them alone, which 4 KiB pages were
-/// ([`quiet_parts`]), and so at the first asking of all of the range.
+/// write faults once a block, as in view memory. Nothing is told less
+/// exactly than before: of the blocks the guards find written the kernel
+/// is asked, them alone, which 4 KiB pages were ([`quiet_parts`]), and so
+/// at the first asking of all of the range.
 ///
-/// For memory the title writes little: every write there costs a fault and
-/// two changes of a block's protection. What the runtime commits over such
-/// blocks is opened ([`title_memory_allocated`]); what it frees is
-/// forgotten ([`forget_views`]). The card's owner takes no block of it
-/// ([`card_take`] wants a view of the page).
+/// For memory that is written little, and by stores of the process (the
+/// kernel's writes do not fault: [`kernel_writing`]): every first write of
+/// a block costs a fault and two changes of its protection. What the
+/// runtime commits over such blocks is opened ([`title_memory_allocated`]);
+/// what it frees is forgotten ([`forget_views`]). The card's owner takes no
+/// block of it ([`card_take`] wants a view of the page).
 pub(crate) fn quiet(start: usize, end: usize) {
     if start >= end || !quiet_on() {
         return;
@@ -1748,7 +1753,7 @@ pub(crate) fn quiet(start: usize, end: usize) {
     static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
         tracing::info!(
-            "private title memory left to the guards (VICTORY_QUIET_GUARD=1): {start:#x}+{:#x}, {} blocks of 64 KiB",
+            "private memory left to the guards (VICTORY_QUIET_GUARD=1): {start:#x}+{:#x}, {} blocks of 64 KiB",
             end - start,
             last - first
         );
