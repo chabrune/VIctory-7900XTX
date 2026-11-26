@@ -4654,6 +4654,17 @@ impl Host {
                 }
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            // Not the blocks that are the card's alone (`owner`): nothing of
+            // them comes back, so nothing of them is compared.
+            let spans = if shadow.has_card_blocks() {
+                let mut around = Vec::with_capacity(spans.len());
+                for (from, to) in spans {
+                    crate::watch::card_gaps(from, to, &mut around);
+                }
+                around
+            } else {
+                spans
+            };
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
