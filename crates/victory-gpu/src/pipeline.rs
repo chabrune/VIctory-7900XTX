@@ -508,21 +508,100 @@ fn every_list() -> &'static [(String, u32, u32)] {
 /// `VICTORY_TRACE_EVERY=<n>` (2 to 16): the title's trace programs (those
 /// that test rays against ray-tracing structures) each run in one frame of
 /// `n`, by turns: the first one drawn with in the first, the next in the
-/// second, and so on. 1 when not given: they run in every frame.
+/// second, and so on (or the turn `VICTORY_TRACE_TURNS` gives it). 1 when
+/// not given: they run in every frame.
+///
+/// `VICTORY_TRACE_EVERY=<least>-<most>`: the number follows the frame's time
+/// ([`trace_adapted`]).
 fn trace_every() -> u32 {
-    static N: OnceLock<[u32; 2]> = OnceLock::new();
-    let read = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (2..=16).contains(n));
+    static N: OnceLock<[u32; 3]> = OnceLock::new();
+    let number = |v: &str| v.trim().parse::<u32>().ok().filter(|n| (2..=16).contains(n));
     let n = N.get_or_init(|| {
-        let n = read("VICTORY_TRACE_EVERY").unwrap_or(1);
-        [n, read("VICTORY_TRACE_EVERY_ALT").unwrap_or(n)]
+        let given = std::env::var("VICTORY_TRACE_EVERY").unwrap_or_default();
+        let (least, most) = match given.split_once('-') {
+            Some((least, most)) => match (number(least), number(most)) {
+                (Some(least), Some(most)) if least <= most => (least, most),
+                _ => (1, 1),
+            },
+            None => number(&given).map_or((1, 1), |n| (n, n)),
+        };
+        if least > 1 {
+            tracing::info!(least, most, "the title's trace programs run in some frames only (VICTORY_TRACE_EVERY)");
+        }
+        [least, most, std::env::var("VICTORY_TRACE_EVERY_ALT").ok().and_then(|v| number(&v)).unwrap_or(least)]
     });
     // Diagnostics: another number by turns, to measure two in one run
     // (`VICTORY_TRACE_EVERY_ALT=<n>` with `VICTORY_AB=<s>,VICTORY_TRACE_ALT`).
     #[cfg(feature = "diagnostics")]
     if n[0] > 1 && crate::ab::pick("VICTORY_TRACE_ALT") == Some(true) {
-        return n[1];
+        return n[2];
     }
-    n[0]
+    if n[0] == n[1] { n[0] } else { trace_adapted(n[0], n[1]) }
+}
+
+/// The trace programs' number now, between `least` and `most`
+/// (`VICTORY_TRACE_EVERY=<least>-<most>`).
+pub(crate) static TRACE_NOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// With `VICTORY_TRACE_EVERY=<least>-<most>`: the number the trace programs
+/// run by now. Looked at every 30 frames: one more when the frames took more
+/// than `VICTORY_TRACE_TARGET_MS` each (32.8 unless given: a little over 30
+/// a second), one less when they took 3.5 ms less than that or better (a
+/// step is worth 0.5 to 1.2 ms of the card's time on an RX 7700 XT, so the
+/// number does not swing). So the traced light is as fresh as a scene leaves
+/// time for, and the heaviest scenes give up some of it for the frame rate.
+fn trace_adapted(least: u32, most: u32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SINCE: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+    static TARGET: OnceLock<f64> = OnceLock::new();
+    let now = TRACE_NOW.load(Relaxed).clamp(least, most);
+    let frame = crate::frame::current();
+    // (Another thread is looking: its answer comes with the next ask.)
+    let Ok(mut since) = SINCE.try_lock() else {
+        return now;
+    };
+    match *since {
+        Some((first, _)) if frame < first + 30 => now,
+        Some((first, at)) => {
+            let target = *TARGET.get_or_init(|| {
+                std::env::var("VICTORY_TRACE_TARGET_MS").ok().and_then(|v| v.parse().ok()).filter(|t| (5.0..=200.0).contains(t)).unwrap_or(32.8)
+            });
+            let ms = at.elapsed().as_secs_f64() * 1e3 / (frame - first) as f64;
+            let next = if ms > target {
+                (now + 1).min(most)
+            } else if ms < target - 3.5 {
+                (now - 1).max(least)
+            } else {
+                now
+            };
+            TRACE_NOW.store(next, Relaxed);
+            *since = Some((frame, std::time::Instant::now()));
+            next
+        }
+        None => {
+            TRACE_NOW.store(now, Relaxed);
+            *since = Some((frame, std::time::Instant::now()));
+            now
+        }
+    }
+}
+
+/// `VICTORY_TRACE_TURNS=<shader hash>:<turn>,..`: the turn of those trace
+/// programs among the frames, instead of the next free one: the costliest
+/// can be kept apart, so that every frame carries about the same.
+fn trace_turns() -> &'static [(String, u32)] {
+    static LIST: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_TURNS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|entry| {
+                let (hash, turn) = entry.trim().split_once(':')?;
+                (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(())?;
+                Some((hash.to_ascii_lowercase(), turn.trim().parse::<u32>().ok().filter(|t| *t < 1024)?))
+            })
+            .collect()
+    })
 }
 
 /// Draws and dispatches left out since the start because their pipeline
@@ -553,21 +632,29 @@ pub(crate) fn rests(this: This) -> bool {
         }
         #[cfg(windows)]
         if trace_every() > 1 && p.shaders.iter().any(|s| s.translated().is_some_and(|t| t.traces)) {
+            // (Those without a turn of their own: behind the ones given.)
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let (n, turn) = (trace_every(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            let turns = trace_turns();
+            let given = p.shaders.iter().find_map(|s| turns.iter().find(|t| t.0 == s.hash)).map(|t| t.1);
+            let first = turns.iter().map(|t| t.1 + 1).max().unwrap_or(0);
+            let turn = given.unwrap_or_else(|| first + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
             tracing::info!(
                 shaders = ?p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>(),
-                every = n,
-                phase = turn % n,
+                turn,
                 "a trace program runs in some frames only (VICTORY_TRACE_EVERY)"
             );
-            return (n, turn, true);
+            return (trace_every(), turn, true);
         }
         (1, 0, false)
     });
     // (A trace program's turn is kept, not its phase: the number may change
     // while the title runs, in a measuring run.)
-    let (n, phase) = if trace { (trace_every(), phase % trace_every().max(1)) } else { (n, phase) };
+    let (n, phase) = if trace {
+        let n = trace_every().max(1);
+        (n, phase % n)
+    } else {
+        (n, phase)
+    };
     let rests = n > 1
         && crate::frame::current() % u64::from(n) != u64::from(phase)
         && if trace { crate::toggled!("VICTORY_TRACE_RESTS") } else { crate::toggled!("VICTORY_PIPELINE_RESTS") };

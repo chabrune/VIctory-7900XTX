@@ -64,7 +64,7 @@ $menu = @(
     @{ K = 'Sharpness'; N = 'Netteté (avec FidelityFX, la 7)'; V = @(); H = 'de 0 (aucune) à 1 ; 0.5 conseillé ; sans effet avec la mise à l''échelle du jeu' }
     @{ K = 'TextureStore'; N = 'Magasin de textures sur disque'; V = @('0', '1'); H = '1 : les textures déjà vues s''affichent tout de suite en pleine définition la fois suivante ; prend environ 2 Go de mémoire vive en plus (à éviter avec 32 Go) et de la place sur le disque (1,5 Go pour trois minutes de jeu, dans %LOCALAPPDATA%\victory-7900xtx\texture-store, à effacer pour repartir de zéro)' }
     @{ K = 'Ambient'; N = 'Lumière ambiante estimée'; V = @(); H = '0 : sortie du jeu telle quelle ; 0.8 conseillé (intérieurs moins noirs sans ray tracing)' }
-    @{ K = 'RayTracing'; N = 'Ray tracing du jeu'; V = @('0', '1'); H = '1 : éclairage indirect par rayons, intérieurs éclairés ; coûte environ la moitié des images (16-18 img/s sur RX 7700 XT)' }
+    @{ K = 'RayTracing'; N = 'Ray tracing du jeu'; V = @('0', 'bas', '1'); H = '0 : sans (lumière ambiante estimée à la place) ; bas : éclairage indirect par rayons calculé une image sur trois, environ 30 img/s sur RX 7700 XT (conseillé) ; 1 : calculé à chaque image, 16-18 img/s' }
     @{ K = 'Safe'; N = 'Mode sûr'; V = @('0', '1'); H = '1 : sans les chemins rapides récents, à essayer d''abord si quelque chose ne va pas' }
     @{ K = 'Build'; N = 'Version du programme'; V = @('diag', 'release'); H = 'diag : celle de toutes les mesures (avec diagnostics) ; release : sans diagnostics' }
     @{ K = 'Extra'; N = 'Réglages libres'; V = @(); H = 'NOM=valeur séparés par des virgules, par ex. VICTORY_PANEL=1 ; vide : aucun' }
@@ -148,6 +148,7 @@ foreach ($pair in ($s.Extra -split ',')) {
 
 $arguments = @{ Exe = $s.Exe; Console = $s.Console; Build = $s.Build; More = $more }
 if ($s.RayTracing -eq '1') { $arguments.RayTracing = $true }
+if ($s.RayTracing -eq 'bas') { $arguments.RayTracingLow = $true }
 if ($s.Safe -eq '1') { $arguments.Safe = $true }
 if ($s.TextureStore -eq '1') { $arguments.TextureStore = $true }
 Write-Host ''

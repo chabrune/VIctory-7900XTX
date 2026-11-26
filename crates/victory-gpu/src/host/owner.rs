@@ -313,6 +313,42 @@ pub(super) fn claim(host: &Host, shadow: &Arc<Shadow>) -> bool {
     true
 }
 
+/// Since the start: copies asked again after a read of ours had brought them
+/// down ([`again`]), and those of them taken.
+static AGAIN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a copy that was the card's alone and was brought down is asked
+/// again, at a submission whose shaders are declared to write it
+/// (`VICTORY_CARD_OWNED_AGAIN=0`: never, as before: opened for good).
+///
+/// Only one that accesses of our own code brought down, not the title's: a
+/// texture the title placed in the buffer's memory is read once when it is
+/// first shown, a window over it is refreshed once. Opened for good, the
+/// copy was compared and fetched after every submission from then on: the
+/// title's 45 MB buffer at 0x962440000, which its trace programs write, was
+/// brought down by one texture read in run rt-low1 and not in five other
+/// runs of the same scene, and 17 MB a frame came back for nobody against 5
+/// (34.8-37.3 ms a frame against 31.1-33.8). Asked again two seconds after,
+/// then four, eight, sixteen and thirty-two; after five times it stays
+/// opened (each time is a fetch of the whole copy).
+pub(super) fn again(shadow: &Shadow) -> bool {
+    crate::toggled!("VICTORY_CARD_OWNED_AGAIN") && shadow.owner_again(5, 2000)
+}
+
+/// [`claim`] for a copy that [`again`] says may be asked again.
+pub(super) fn claim_again(host: &Host, shadow: &Arc<Shadow>) -> bool {
+    AGAIN[0].fetch_add(1, Relaxed);
+    // (Turned down now, it is not asked a third time: its state is free.)
+    let taken = claim(host, shadow);
+    if taken {
+        AGAIN[1].fetch_add(1, Relaxed);
+    } else if shadow.owner().load(Acquire) == OPENED {
+        // (Not of the kind any more: no further asking.)
+        shadow.owner_opened(false);
+    }
+    taken
+}
+
 /// Brings `shadow` down and opens its pages; the caller made its state
 /// [`FETCHING`].
 fn open(shadow: &Shadow, who: Option<Who>) {
@@ -352,6 +388,9 @@ fn open(shadow: &Shadow, who: Option<Who>) {
     table().remove(&first);
     COUNT.fetch_sub(1, Relaxed);
     STATS[4].fetch_sub(len, Relaxed);
+    // (Only an access of our own code leaves it to be asked again:
+    // [`again`].)
+    shadow.owner_opened(who.is_some_and(|who| who.2));
     let (site, kind, ours, stack) = who.unwrap_or((0, 2, true, 0));
     STATS[if ours { 3 } else { 2 }].fetch_add(1, Relaxed);
     let mut openers = OPENERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1072,13 +1111,15 @@ pub(super) fn line() {
         );
     }
     tracing::info!(
-        "copies that are the card's alone (VICTORY_CARD_OWNED=1): {} now, {} MB; since the start {} taken, {} turned down, {} opened by the title, {} by code of ours or let go; the first opened: {}",
+        "copies that are the card's alone (VICTORY_CARD_OWNED=1): {} now, {} MB; since the start {} taken, {} turned down, {} opened by the title, {} by code of ours or let go, {} of those asked again and {} taken again (VICTORY_CARD_OWNED_AGAIN); the first opened: {}",
         COUNT.load(Relaxed),
         s[4] >> 20,
         s[0],
         s[1],
         s[2],
         s[3],
+        AGAIN[0].load(Relaxed),
+        AGAIN[1].load(Relaxed),
         if openers.is_empty() { "none".to_owned() } else { openers.join("; ") }
     );
 }

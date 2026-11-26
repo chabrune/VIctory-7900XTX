@@ -1547,7 +1547,10 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    // (`VICTORY_GPU_TIMING_ROWS=<n>`: so many of them, 40 unless given.)
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let rows = *ROWS.get_or_init(|| std::env::var("VICTORY_GPU_TIMING_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(40));
+    for (what, (n, us, longest)) in by.into_iter().take(rows) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,

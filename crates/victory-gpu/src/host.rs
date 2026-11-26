@@ -4538,6 +4538,8 @@ impl Host {
             for (shadow, ranges) in declared {
                 if shadow.owner_unasked() {
                     owner::claim(self, shadow);
+                } else if owner::again(shadow) {
+                    owner::claim_again(self, shadow);
                 }
                 // In view memory, block by block (the title writes some).
                 owner::claim_blocks(self, shadow, ranges);
@@ -9695,8 +9697,10 @@ impl Meter {
                     let since = rested - BEFORE.swap(rested, Ordering::Relaxed);
                     if since != 0 {
                         tracing::info!(
-                            "draws and dispatches left out per frame because their pipeline rested (VICTORY_TRACE_EVERY, VICTORY_PIPELINE_EVERY): {:.1}",
-                            since as f64 / frames
+                            "draws and dispatches left out per frame because their pipeline rested (VICTORY_TRACE_EVERY, VICTORY_PIPELINE_EVERY): {:.1}; \
+                             the trace programs' number now, where it follows the frame's time: {}",
+                            since as f64 / frames,
+                            crate::pipeline::TRACE_NOW.load(Ordering::Relaxed)
                         );
                     }
                 }

@@ -1,7 +1,9 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
-# -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -RayTracing   the title's own ray-traced indirect light: lit interiors, about half the frame rate
+# -RayTracingLow the same light with the title's trace programs run one frame in three, by turns
+#               (what they wrote stands in between): about 30 frames a second on an RX 7700 XT
 # -TextureStore keeps the textures' larger levels on disk so that they show at once next time
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
@@ -14,6 +16,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$RayTracingLow,
     [switch]$TextureStore,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
@@ -30,7 +33,20 @@ if ($Safe) {
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
-if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($RayTracing -or $RayTracingLow) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($RayTracingLow) {
+    # The title's 13 trace programs (those that test rays against its structures) each run
+    # in one frame of three to six, by turns, and what they wrote stands in between; the
+    # title blends what they give over frames anyway. The number follows the frame's time:
+    # three while a frame takes under 29 ms, up to six while it takes over 32.8 (the heavy
+    # gameplay scene of the opening: 34.9 ms at three, 31.1 at six, RX 7700 XT).
+    # The five that cost the card most are given their turns so that every frame carries
+    # about the same (7.9, 6.8 and 4.4 ms of a timing run's 20.4). These are hashes of the
+    # title's shaders in the build measured; another build's are not found and its programs
+    # take turns in the order they are first used.
+    $settings.VICTORY_TRACE_EVERY = '3-6'
+    $settings.VICTORY_TRACE_TURNS = 'f22a76fcb967ee59:0,6d7fe7745ab9c6d8:1,b58eb3ca6ee46427:2,3592426e3e9142d8:2,36f04a4ed0ad1d9b:2'
+}
 if ($TextureStore) {
     # The larger levels of textures seen whole are kept on disk and shown at once the next
     # time, instead of seconds later when the title has streamed them in (2,770 to 4,100

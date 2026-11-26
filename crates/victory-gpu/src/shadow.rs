@@ -111,6 +111,11 @@ pub(crate) struct Shadow {
     owned: AtomicU8,
     /// Whether that was asked for the copy (once).
     owner_asked: std::sync::atomic::AtomicBool,
+    /// When a read or write of our own code last brought the copy down from
+    /// the card (`crate::host::coarse_ms`, 40 bits) and, above, how many
+    /// times one did; all ones once something else did
+    /// ([`Shadow::owner_again`]).
+    owner_opens: AtomicU64,
     /// How many of our threads are reading the copy's title memory now
     /// ([`Shadow::reading`]): the card takes the copy when none is.
     readers: std::sync::atomic::AtomicU32,
@@ -3546,6 +3551,31 @@ impl Shadow {
         !self.owner_asked.swap(true, Ordering::Relaxed)
     }
 
+    /// The copy was brought down from the card: by an access of our own code
+    /// (`ours`: a texture read where the title placed one in the buffer's
+    /// memory, a refresh of another copy) or by the title, the kernel or a
+    /// release.
+    pub(crate) fn owner_opened(&self, ours: bool) {
+        const TIME: u64 = (1 << 40) - 1;
+        let was = self.owner_opens.load(Ordering::Relaxed);
+        let now = if ours && was != u64::MAX { ((was >> 40) + 1) << 40 | (crate::host::coarse_ms() & TIME) } else { u64::MAX };
+        self.owner_opens.store(now, Ordering::Relaxed);
+    }
+
+    /// Whether the card may be asked again to own the copy: it was brought
+    /// down by accesses of our own code only, `most` times at most, and the
+    /// last one was `rest_ms` ago or more, twice as long after each time.
+    pub(crate) fn owner_again(&self, most: u64, rest_ms: u64) -> bool {
+        const TIME: u64 = (1 << 40) - 1;
+        let opens = self.owner_opens.load(Ordering::Relaxed);
+        let times = opens >> 40;
+        opens != u64::MAX
+            && times != 0
+            && times <= most
+            && self.owned.load(Ordering::Relaxed) == crate::host::owner::OPENED
+            && (crate::host::coarse_ms() & TIME).saturating_sub(opens & TIME) >= rest_ms << (times - 1).min(8)
+    }
+
     /// Whether the copy is of the kind the card may own: a title buffer of
     /// `least` bytes and more with a side in the card's memory, in memory the
     /// kernel watches.
@@ -3683,6 +3713,7 @@ impl Shadow {
             place: None,
             owned: AtomicU8::new(0),
             owner_asked: Default::default(),
+            owner_opens: Default::default(),
             readers: Default::default(),
             owned_blocks: Default::default(),
             asked_blocks: Mutex::default(),
