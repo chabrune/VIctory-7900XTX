@@ -91,6 +91,10 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// There is no title memory behind the copy: its owner writes the CPU's
+    /// side and says what changed ([`by_address_fed`]). Nothing is read at
+    /// its address ([`Shadow::reading`]).
+    fed: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -3277,6 +3281,10 @@ impl Shadow {
     /// (the taking waits for the readers it finds, and a reader looks at
     /// the state after it has counted itself).
     fn reading(&self) -> Option<Reading<'_>> {
+        // (No memory at its address: the owner of the copy fills it.)
+        if self.fed {
+            return None;
+        }
         loop {
             self.readers.fetch_add(1, Ordering::SeqCst);
             if matches!(self.owned.load(Ordering::SeqCst), crate::host::owner::OWNED | crate::host::owner::FETCHING | crate::host::owner::SEALING) {
@@ -3669,6 +3677,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            fed: false,
             changes_only: Default::default(),
             mapped: false,
             place: None,
@@ -4905,6 +4914,25 @@ impl Shadow {
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
     pub(crate) fn resend(&self, from: usize, to: usize) {
         self.card_changed(from, to);
+    }
+
+    /// [`Shadow::resend`] of each of `runs`, in order.
+    pub(crate) fn resend_runs(&self, runs: &[(usize, usize)]) {
+        self.card_changed_runs(runs.iter().copied());
+    }
+
+    /// Whether the copy's owner writes its CPU's side ([`by_address_fed`]).
+    pub(crate) fn fed(&self) -> bool {
+        self.fed
+    }
+
+    /// The CPU's side of a copy its owner writes ([`by_address_fed`]): `len`
+    /// bytes, the copy's offsets. What is changed there is told with
+    /// [`Shadow::resend`] after it is written, and goes to the card's side
+    /// before the next submission.
+    pub(crate) fn cpu_side(&self) -> *mut u8 {
+        debug_assert!(self.fed);
+        self.data
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
@@ -6221,6 +6249,19 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    by_address_of(start, len, false)
+}
+
+/// As [`by_address`], for memory that exists nowhere but in the copy: the
+/// CPU's side is written by the caller ([`Shadow::cpu_side`]), who tells
+/// what it changed ([`Shadow::resend`]); `[start, start + len)` only names
+/// the copy (addresses with nothing behind them), and no refresh reads
+/// there. The CPU's side starts as zeros.
+pub(crate) fn by_address_fed(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    by_address_of(start, len, true)
+}
+
+fn by_address_of(start: u64, len: u64, fed: bool) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
@@ -6253,6 +6294,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.fed = fed;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,

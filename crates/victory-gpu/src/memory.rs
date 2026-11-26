@@ -109,6 +109,29 @@ const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
+/// Whether an arena is nothing but its copy (`VICTORY_MEMORY_DIRECT=1`; off
+/// by default): what is taken of title memory for a page is merged into the
+/// CPU's side of the arena's copy, and the dwords that changed are told to
+/// go up.
+///
+/// An arena was 64 MiB of memory of ours that held the pages as last
+/// taken, with a copy over it: 64 MiB more for the copy's CPU side and 64
+/// on the card. Every list that came to memory by address refreshed every
+/// arena whole, so each submission that traces or builds asked the kernel
+/// what was written in all of them (20 arenas: 4.9 GB of page tables walked
+/// a frame, 4 to 5 ms of the submitting thread, run rt-trace3), read the
+/// written pages back out of the arena and compared them with the copy's
+/// side again, dword by dword, as this module had just done against title
+/// memory. Left to the guards instead (`VICTORY_QUIET_GUARD`) the askings
+/// went, for 86 to 327 faults a frame of this module's own stores (run
+/// rt-quiet2). Only this module writes an arena, and it knows each dword it
+/// changes: with the switch nobody is asked, the arena's own memory is not
+/// there (1.3 GB for 20), and no list refreshes an arena.
+fn direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DIRECT").is_some_and(|v| v == "1"))
+}
+
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
@@ -392,16 +415,21 @@ impl Memory {
 
     /// Another arena's pages.
     fn another(&mut self) -> bool {
-        let Some(at) = crate::upload::reserve(ARENA as usize) else {
+        // ([`direct`]: addresses only, to name the copy and its pages by.)
+        let direct = direct();
+        let Some(at) = (if direct { crate::upload::reserve_space(ARENA as usize) } else { crate::upload::reserve(ARENA as usize) }) else {
             return false;
         };
-        // Every list that comes to memory by address refreshes every arena
-        // whole (`bring_up`), and only this module writes them, a few pages
-        // a frame: the guards say which, not an asking of the kernel's over
-        // all 64 MiB of each at every submission (`crate::watch::quiet`;
-        // the stores below fault once a block and go on).
-        crate::watch::quiet(at, at + ARENA as usize);
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        if !direct {
+            // Every list that comes to memory by address refreshes every
+            // arena whole (`bring_up`), and only this module writes them: the
+            // guards say which blocks, not an asking of the kernel's over all
+            // 64 MiB of each at every submission (`crate::watch::quiet`; the
+            // stores below fault once a block and go on).
+            crate::watch::quiet(at, at + ARENA as usize);
+        }
+        let copy = if direct { crate::shadow::by_address_fed(at as u64, ARENA) } else { crate::shadow::by_address(at as u64, ARENA) };
+        let Some(n) = copy.and_then(|s| self.number(s)) else {
             return false;
         };
         self.arenas.push((n, at));
@@ -537,17 +565,31 @@ impl Memory {
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
+            // ([`direct`]: the page as last taken is in the copy's own side.)
+            let fed = shadow.fed();
+            // SAFETY: inside the copy's CPU side, `base` its page's offset.
+            let side = if fed { unsafe { shadow.cpu_side().add(base) } } else { held.at as *mut u8 };
+            let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut title = [0u8; PIECE];
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
-                // SAFETY: a page of an arena of ours, under the mutex.
-                let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                // SAFETY: a page of an arena of ours (or of its copy's side),
+                // under the mutex.
+                let ours = unsafe { std::slice::from_raw_parts_mut(side.add(piece), PIECE) };
+                self.stats.changed += if fed && !never {
+                    merge_runs(&title, ours, base + piece, &mut runs)
+                } else {
+                    merge(&title, ours, never)
+                } as u64
+                    * 4;
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
+            } else if !runs.is_empty() {
+                // (After the bytes are in: what is sent up is what is told.)
+                shadow.resend_runs(&runs);
             }
         }
         self.stats.micros += started.elapsed().as_micros() as u64;
@@ -645,18 +687,29 @@ impl Memory {
         let Some(held) = self.pages.get(&page) else { return };
         let shadow = &self.copies[held.copy];
         let base = held.at - shadow.span().0 as usize;
+        // ([`direct`]: into the copy's own side, the changed dwords told.)
+        let fed = shadow.fed();
+        // SAFETY: inside the copy's CPU side, `base` its page's offset.
+        let side = if fed { unsafe { shadow.cpu_side().add(base) } } else { held.at as *mut u8 };
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut title = [0u8; PIECE];
         let mut at = from;
         while at < to {
             let n = (PIECE - at % PIECE).min(to - at);
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
-            // SAFETY: a page of an arena of ours, under the mutex.
-            let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
-            if *ours != title[..n] {
+            // SAFETY: a page of an arena of ours (or of its copy's side),
+            // under the mutex.
+            let ours = unsafe { std::slice::from_raw_parts_mut(side.add(at), n) };
+            if fed {
+                merge_runs(&title[..n], ours, base + at, &mut runs);
+            } else if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
                 crate::watch::wrote(held.at + at, n);
             }
             at += n;
+        }
+        if !whole && !runs.is_empty() {
+            shadow.resend_runs(&runs);
         }
         if whole {
             shadow.resend(base + from, base + to);
@@ -755,6 +808,12 @@ impl Memory {
         let (start, len) = self.directory.1.span();
         self.directory.1.refresh(list, start, len);
         for shadow in &self.copies {
+            // (An arena that is nothing but its copy, [`direct`]: what this
+            // module changed of it goes up before the next submission, with
+            // nothing to ask or to read.)
+            if shadow.fed() {
+                continue;
+            }
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
         }
@@ -874,6 +933,31 @@ fn packed_len(header: u64) -> Option<u64> {
     // builder's own program of a structure's size stores one more.
     let len = (nodes + 1) * 64;
     (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && len <= PACKED).then_some(len)
+}
+
+/// As [`merge`] of bytes held before, for a copy's own side ([`direct`]):
+/// the dwords of `title` that differ are put into `ours` (as long; a tail
+/// short of a dword counts as one), and each run of them is added to `runs`
+/// as offsets from `at`, the offset of `ours` in the copy. How many dwords.
+fn merge_runs(title: &[u8], ours: &mut [u8], at: usize, runs: &mut Vec<(usize, usize)>) -> usize {
+    if ours == title {
+        return 0;
+    }
+    let mut changed = 0;
+    let mut offset = 0;
+    for (t, o) in title.chunks(4).zip(ours.chunks_mut(4)) {
+        if t != o {
+            o.copy_from_slice(t);
+            changed += 1;
+            let (from, to) = (at + offset, at + offset + t.len());
+            match runs.last_mut() {
+                Some(last) if last.1 == from => last.1 = to,
+                _ => runs.push((from, to)),
+            }
+        }
+        offset += t.len();
+    }
+    changed
 }
 
 /// Puts what `title` holds into `ours` (what was last taken): the dwords that
@@ -1289,6 +1373,25 @@ mod tests {
     fn a_piece_takes_what_changed() {
         let mut title = [7u8; PIECE];
         let mut ours = vec![0u8; PIECE];
+        {
+            // The runs of dwords that differ, by their offsets in the copy.
+            let (title, mut ours) = ([7u8; 64], [7u8; 64]);
+            let mut runs = Vec::new();
+            assert_eq!(merge_runs(&title, &mut ours, 4096, &mut runs), 0);
+            ours[4] = 1;
+            ours[9] = 1;
+            ours[40] = 1;
+            ours[63] = 1;
+            assert_eq!(merge_runs(&title, &mut ours, 4096, &mut runs), 4);
+            assert_eq!(runs, [(4100, 4108), (4136, 4140), (4156, 4160)]);
+            assert_eq!(ours, title);
+            // A run goes on over the pieces' line; a tail short of a dword.
+            let mut ours = [7u8; 6];
+            ours[0] = 2;
+            ours[5] = 2;
+            assert_eq!(merge_runs(&title[..6], &mut ours, 4160, &mut runs), 2);
+            assert_eq!(runs, [(4100, 4108), (4136, 4140), (4156, 4166)]);
+        }
         assert_eq!(merge(&title, &mut ours, true), PIECE / 4);
         assert_eq!(ours, title);
         assert_eq!(merge(&title, &mut ours, false), 0);

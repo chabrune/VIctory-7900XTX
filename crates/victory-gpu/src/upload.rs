@@ -87,6 +87,28 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
     (at != 0).then_some(at)
 }
 
+/// Addresses in [4 GiB, 2^37) with no memory behind them: a place of its own
+/// for a copy whose CPU's side its owner writes (`crate::memory`'s arenas
+/// with `VICTORY_MEMORY_DIRECT`), where nothing of the title's can lie.
+pub(crate) fn reserve_space(len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements, PAGE_NOACCESS,
+        VirtualAlloc2,
+    };
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: (1usize << 32) as *mut _,
+        HighestEndingAddress: ((1usize << 37) - 1) as *mut _,
+        Alignment: 0,
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: a fresh reservation; the parameter points at `requirements`,
+    // which outlives the call.
+    let at = unsafe { VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS, &mut parameter, 1) } as usize;
+    (at != 0).then_some(at)
+}
+
 impl Upload {
     pub(crate) fn new(len: usize) -> Option<Upload> {
         if !low() {
