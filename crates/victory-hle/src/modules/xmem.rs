@@ -336,6 +336,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    if let Some(user) = alloc_watched(size, layout.align()) {
+        return user;
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -357,6 +360,66 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
+/// In a block's header where its alignment would be: an allocation of its
+/// own ([`alloc_watched`]), and the size's place holds where it begins.
+const WATCHED: usize = usize::MAX;
+
+/// Allocations of [`alloc_watched`] the system would not take back when they
+/// were freed (a heap of the card's stood on their pages): tried again.
+static FREE_LATER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// A block of a megabyte and more for [`XMemAllocDefault`] as an allocation of
+/// its own from the system, write-watched, with the block on a 64 KiB page of
+/// its own (`VICTORY_ALLOC_WATCHED=0`: from the process heap, as before);
+/// `None` for a smaller one or if the system has none.
+///
+/// In the process heap nothing says what was written to such a block, and the
+/// title places buffers the card uses in them: the host copy of one was
+/// copied whole at every refresh. One of 20 MB that only shaders write, twice
+/// a frame: 42 MB and 4.6 to 6.3 ms a frame of the thread that prepares
+/// submissions, all of it sent up to the card and fetched back (an RX 7700 XT,
+/// Series S profile, 2026-11-26). Watched, a refresh copies the pages the
+/// title wrote; and memory of this kind can be opened as the card's own.
+fn alloc_watched(size: usize, align: usize) -> Option<*mut c_void> {
+    const BLOCK: usize = 64 << 10;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if size < 1 << 20 || !*ON.get_or_init(|| std::env::var_os("VICTORY_ALLOC_WATCHED").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    FREE_LATER.lock().unwrap_or_else(|e| e.into_inner()).retain(|&base| {
+        // SAFETY: an allocation of ours the title has freed.
+        unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) == 0 }
+    });
+    let align = align.max(BLOCK);
+    // The header's page, the block, and what a larger alignment may skip.
+    let bytes = (BLOCK + size).checked_add(align - BLOCK)?.checked_next_multiple_of(BLOCK)?;
+    // SAFETY: a plain allocation; zeroed by the system.
+    let base = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+    if base == 0 {
+        return None;
+    }
+    let user = (base + BLOCK).next_multiple_of(align);
+    // SAFETY: the page below `user` is ours and committed.
+    unsafe { ((user - HEADER) as *mut [usize; 2]).write([base, WATCHED]) };
+    tracing::info!(mb = size >> 20, at = format_args!("{user:#x}"), "a block of the title's general allocator in an allocation of its own, write-watched (VICTORY_ALLOC_WATCHED=0: not)");
+    Some(user as *mut c_void)
+}
+
+/// Frees what [`alloc_watched`] gave: `user`, in the allocation at `base`.
+fn free_watched(user: usize, base: usize) {
+    // SAFETY: a question about an address.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; the structure is ours.
+    unsafe { VirtualQueryEx(GetCurrentProcess(), base as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+    // What the card has in place there goes first: its heap holds the pages
+    // while it stands.
+    victory_gpu::title_memory_freeing(user, (base + info.RegionSize).saturating_sub(user));
+    // SAFETY: an allocation of ours that the title has freed.
+    if unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) } == 0 {
+        FREE_LATER.lock().unwrap_or_else(|e| e.into_inner()).push(base);
+    }
+}
+
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
@@ -371,6 +434,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align == WATCHED {
+            free_watched(user as usize, size);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
