@@ -145,6 +145,9 @@ struct Card {
     me: std::sync::OnceLock<(u64, std::sync::Weak<Shadow>)>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// With `crate::host::pages`: the card's side is a reserved buffer, and
+    /// this keeps its pages' tiles (and can show a page another copy's).
+    paged: Option<crate::host::pages::Paged>,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -433,6 +436,20 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     Some(buffer)
 }
 
+/// [`card_for`] for the title buffer at `start`: where card sides are made
+/// page by page (`crate::host::pages`), one of view memory that begins on a
+/// 64 KiB line is a reserved buffer, and what keeps its pages comes with it.
+fn card_for_at(start: u64, size: u64) -> Option<(ID3D12Resource, Option<crate::host::pages::Paged>)> {
+    if crate::host::pages::on()
+        && start.is_multiple_of(1 << 16)
+        && crate::inplace::section_of(start as usize).is_some()
+        && let Some((buffer, paged)) = card_room_for_how(size, true)
+    {
+        return Some((buffer, paged));
+    }
+    card_for(size).map(|buffer| (buffer, None))
+}
+
 /// Whether every title buffer's copy has two sides, however small
 /// (`VICTORY_CARD_ALL=1`; off by default).
 ///
@@ -449,6 +466,12 @@ fn card_all() -> bool {
 
 /// [`card_for`] in the card's own memory.
 fn card_room_for(size: u64) -> Option<ID3D12Resource> {
+    card_room_for_how(size, false).map(|made| made.0)
+}
+
+/// [`card_room_for`]; with `paged`, a reserved buffer with its pages
+/// (`crate::host::pages`) or nothing.
+fn card_room_for_how(size: u64, paged: bool) -> Option<(ID3D12Resource, Option<crate::host::pages::Paged>)> {
     if !cards() {
         return None;
     }
@@ -498,7 +521,11 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = crate::pool::card_buffer(&host.device, size).or_else(|| host.uav_buffer(size));
+    let buffer = if paged {
+        crate::host::pages::Paged::make(host, size).map(|(buffer, paged)| (buffer, Some(paged)))
+    } else {
+        crate::pool::card_buffer(&host.device, size).or_else(|| host.uav_buffer(size)).map(|buffer| (buffer, None))
+    };
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -5109,6 +5136,7 @@ impl Shadow {
                 touched: Default::default(),
                 me: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
+                paged: None,
             });
         }
         let shadow = Arc::new(shadow);
@@ -5266,6 +5294,7 @@ mod land_tests {
                 touched: Default::default(),
                 me: Default::default(),
             size: len as u64,
+            paged: None,
         });
         Some(shadow)
     }
@@ -5873,8 +5902,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+        let (buffer, card) = match card_for_at(key.0, size) {
+            Some((on_card, paged)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -5889,6 +5918,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 touched: Default::default(),
                 me: Default::default(),
                     size,
+                    paged,
                 };
                 (on_card, Some(card))
             }
@@ -6116,6 +6146,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         touched: Default::default(),
         me: Default::default(),
         size: len,
+        paged: None,
     });
     let shadow = Arc::new(shadow);
     carded(&shadow);
@@ -6206,6 +6237,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 touched: Default::default(),
                 me: Default::default(),
                 size: len,
+                paged: None,
             };
             (on_card, Some(card))
         }

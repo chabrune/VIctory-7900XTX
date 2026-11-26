@@ -3860,6 +3860,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::inplace::blocks_line();
     owner::line();
+    pages::line();
     #[cfg(feature = "diagnostics")]
     crate::shadow::overlaps_line();
     crate::port_cbv::log(frames);
@@ -3904,6 +3905,7 @@ mod place;
 pub(crate) mod rec;
 mod send;
 pub(crate) mod owner;
+pub(crate) mod pages;
 mod sender;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
