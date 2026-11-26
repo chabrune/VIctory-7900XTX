@@ -140,6 +140,40 @@ from the registers above. Nothing is gained on the picture by either; whether th
 title's own way round costs frames (a pipeline asked for again and again) is not
 measured.
 
+## The card's memory on an RX 7700 XT (12 GB, Series S profile), 2026-11-26
+
+The card is full two minutes into the world (9.7 to 9.9 GB of a budget of 10.1) and the
+PC's memory with it (95 %); the card's own load is 98 %, the processors' 46 %. What
+was found, and what was done about it:
+
+- **What the driver gives a buffer of its own**: a multiple of 256 KiB (256 KiB for
+  64 KiB asked, 512 for 280), a target 1280x720 about a tenth more than its texels, a
+  command list 64 KiB of the card and 1 MiB of the PC, a view heap of a million slots
+  30 MB (objects made on a device of their own, the memory in use asked for before and
+  after). The copies of title buffers on the card (3,700 from 64 KiB up) and the lists'
+  scratch buffers for indirect arguments (3,300) are cut from blocks of 64 MiB now,
+  64 KiB each at least (`VICTORY_BUFFER_POOL=0`: allocations of their own).
+- **Room kept for targets that never came**: 3,072 MB of the card were kept for render
+  targets, the Series X profile's measure; the Series S profile's are 1,350 MB. It is
+  1,536 MB there now.
+- With both, the textures the title fills that are alive on the card went from 15,800
+  (1.4 GB) to 47,000-58,000, and the texture queue no longer finds the card without
+  room (152 passes of it did in two minutes).
+- **Not accounted for yet**: about 2.4 GB of the card's memory in use that is neither a
+  block of textures or buffers nor a target (0.6 GB of it before the world; some 0.6 GB
+  are lists, their preludes and the big copies). It still grows slowly in the world.
+- **What the card reads over the bus**: the copies of windows of title memory (the
+  title's own vertices, indices and constants, 3.4 GB) are in the PC's memory, because
+  the card has no room (`VICTORY_CARD_WINDOWS_MB`, 0). Moving the title buffers from
+  64 KiB up to the card took the card's working time from 45 to 32 ms a frame.
+
+How a frame was measured to go (four frames of 43 ms in the world, `VICTORY_TIMELINE`,
+and `VICTORY_GPU_TIMING`): the card running submissions is the longest link of the
+chain (12.7 ms a frame, one frame in four all of it); the title's own commands take
+19 ms of the card and more (dispatches 7.9, indirect executions 5.4, mesh draws 3.3);
+the submitting thread works 32 to 35 ms. The lines the frame meter logged once a second
+took 16.8 ms of the frame they fell in; they are written by a thread of their own now.
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask
