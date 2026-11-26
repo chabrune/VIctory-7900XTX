@@ -391,9 +391,7 @@ enum Job {
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
     /// A signal of the queue's.
     Signal(usize, u64),
-    /// A frame is shown: the texture and the state its lists leave it in.
-    /// Plane 0 and the interface plane, each with the state its lists left it
-    /// in (`u32::MAX`: the one it is in when its turn comes).
+    /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
     Present(
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
@@ -594,10 +592,11 @@ impl Work for Job {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
                     let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
-                    let overlay = overlay.as_ref().map(|(o, s)| {
-                        (&o.texture, if *s == u32::MAX { o.state.load(Relaxed) } else { *s })
+                    let over = overlay.as_ref().map(|(ov, ov_state)| {
+                        let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
+                        (&ov.texture, st)
                     });
-                    super::show(&texture.texture, state, overlay, shown);
+                    super::show_planes(&texture.texture, state, over, shown);
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
