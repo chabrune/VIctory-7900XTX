@@ -518,6 +518,67 @@ them nor shares them: 620 a frame in the second row, none in the third. What is 
 compared is private memory (the title's general allocator) under copies that begin off
 the 64 KiB lines.
 
+### What did not pay (the same day)
+
+- The waits for every earlier shader write. The title's barrier groups read as the
+  host's own structures (`VICTORY_BARRIER_CENSUS=1`, taken where the title calls: lists
+  translated later keep only their count): of 20,000 calls 8,500 hold buffer barriers
+  alone, 2,100 textures alone with no unordered access before, 1,300 a global one; of
+  the barriers 17,300 are a buffer's unordered access to unordered access, 8,200 a
+  buffer's unordered access to shader resource, 5,000 a texture's unordered access to
+  itself. So nearly all of them are waits the console makes too; one call in ten could
+  go. Joined where nothing stands between two (`victory replay --merge-barriers`): 25.6
+  ms of the card against 25.8.
+- Constants in the card's memory. With the tables' constant buffers copied into lists'
+  scratch in card memory (`VICTORY_PORT_CBV_PLACE=0 VICTORY_SCRATCH_CARD=1`) the card
+  works 24.9 ms a frame against 25.0 and the preparing thread 28.5 against 26: the
+  replay's 1.2 ms do not show in the title. Without renderer port 1
+  (`VICTORY_PORT_CONSTANTS=0`) this profile now stops where the world begins (the title
+  stands still for half a minute, then its own crash reporter runs): not looked into.
+- A longer rest for blocks the title writes every frame: `VICTORY_GUARD_HOT=40` the
+  same frame rate, `VICTORY_GUARD_REST=30000` 33 fps against 35.
+- Ownership from 64 KiB up (`VICTORY_CARD_OWNED_KB=64`): 780 pieces compared a frame
+  against 1,000, the frame rate the same.
+
+## The picture: textures and the upscaler (2026-11-26, evening)
+
+What was seen on the screen: surfaces without their textures or with coarse ones, and a
+dotted, pixelated picture (hair, the edges of shadows, nets).
+
+**Textures had no room.** The card stood over its budget (10.3 GB in use of 10.2), the
+pass that makes textures picked by index found no room 1,700 times in three minutes, and
+57,000 host copies of textures were let go (5.5 GB) for 21,700 alive. A gigabyte of the
+card was the windows of title memory mapped by the CPU (`VICTORY_WINDOWS_BAR_MB=1024`),
+which no longer buy frames: 34.4-35.3 fps without them against 34.3-35.8, the card
+working 27.0 ms a frame against 25.0. Without: 29,000 copies alive, 26 passes without
+room, 9.9 GB in use. The profile has them off now.
+
+Of the copies alive, 1.0 to 1.7 GB are levels whose title memory is not mapped (the
+largest level of 7,000 textures): the title views a texture from a level it has not
+streamed in yet, and the copy is made from the first level viewed. To do: from the
+first level held, grown when the larger one is mapped (`resource::want_level` has the
+replacing). `VICTORY_LEVELS_ON_DEMAND=1` is not that in this tree: it turns the levels
+viewed alone off and makes no texture level by level (12.5 GB asked of the card, 5
+fps).
+
+**The texture store** (`VICTORY_TEXTURE_STORE=<folder>`, `scripts\play.ps1
+-TextureStore`): the larger levels of textures seen whole, kept on disk and given at
+once when the texture is next viewed from a smaller level. A first run of three
+minutes kept 2,700 textures (1.5 GB); in the next, 2,770 to 4,100 host copies were made
+whole from it where the title would have streamed the levels in over seconds (a slot
+written while its memory is not there waits 6 to 7.6 s on average to be shown).
+`VICTORY_TEXTURE_STORE_KEEP_MB` bounds what of it stays in memory (4 GiB unless given).
+
+**The dots are the upscaler's.** On Series S the title picks FidelityFX, and its FSR 4
+passes come as pipelines made for the console's card: `DeserializeComputePipelineStateX`
+is not implemented here ("FAILED hr=0x80004001 for 'FFX_FSR4_PASS_0' -- falling back
+to NewBE", 29 passes), `amd_fidelityfx_upscaler_xbox.dll` is refused by the host
+policy, and what the fallback gives leaves everything the title dithers for the
+upscaler to smooth as dots. With the title's own upscaler (`VICTORY_UPSCALER=6`, what
+it uses on Series X; the same 1280x720 to 1920x1080) the picture is smooth, at the
+same frame rate. The profile uses it now. Its scale (`VICTORY_RENDER_SCALE=0.8`) ends
+the title at its start on this profile, as the other sizes do.
+
 ## The other repositories, compared
 
 Read up to 2026-11-25: Marvisak/VIctory, fxceless/victory-fork, DexNom/VIctory,

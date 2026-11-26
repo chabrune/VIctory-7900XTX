@@ -604,6 +604,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    // Diagnostics: what they hold, while the title's structures are there.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if count > 0 {
+        // SAFETY: the title's groups, as it gave them.
+        unsafe { super::groups_census(count, _groups) };
+    }
     front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {

@@ -2,6 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -TextureStore keeps the textures' larger levels on disk so that they show at once next time
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Console      series-x (the default: 3840x2160) or series-s: the title renders lower and
@@ -13,6 +14,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$TextureStore,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [hashtable]$More = @{}
@@ -29,6 +31,16 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($TextureStore) {
+    # The larger levels of textures seen whole are kept on disk and shown at once the next
+    # time, instead of seconds later when the title has streamed them in (2,770 to 4,100
+    # textures in the first three minutes of a second run). It grows with what is played
+    # (1.5 GB for those three minutes; nothing is ever removed: delete the folder to start
+    # over), and keeps 512 MB of it in memory; the title then takes 27.5 GB of the PC's
+    # memory against 25.2 (1.5 GB left free of 32).
+    $settings.VICTORY_TEXTURE_STORE = Join-Path $env:LOCALAPPDATA 'victory-7900xtx\texture-store'
+    $settings.VICTORY_TEXTURE_STORE_KEEP_MB = '512'
+}
 if ($Console -eq 'series-s') {
     # Every title buffer's copy from 64 KiB up in the card's memory (at most
     # 1 GiB of them), so that the card, not the CPU, finds what shaders wrote
@@ -49,7 +61,12 @@ if ($Console -eq 'series-s') {
     # card working 32 / - / 27 ms a frame, the PC's free memory 1.5 / 2.3 / 3.5 GB, textures
     # alive on the card 50,000 / 38,000 / 20,000 (the card is full: what windows take, textures
     # lose), frames 21-23 / 22 / 23 a second. -More @{VICTORY_WINDOWS_BAR_MB='0'} or '2048'.
-    $settings.VICTORY_WINDOWS_BAR_MB = '1024'
+    # 2026-11-26, later: 0. With renderer port 1 and the copies of one page sharing the card's
+    # memory the frame rate is the same with and without (34.4-35.3 fps against 34.3-35.8, the
+    # card working 27.0 ms a frame against 25.0), and the textures have the room: 29,000 host
+    # copies of them alive against 21,700, 26 passes that made none for lack of room against
+    # 1,700, the card 9.9 GB in use of a 10.2 GB budget against 10.3 GB.
+    $settings.VICTORY_WINDOWS_BAR_MB = '0'
     # The title's 185 MB heap of constants read by the card where the title writes it (renderer
     # port 1 of avatarmanz/VIctory-7900XTX): nothing of it sent up, fetched back or compared. RX
     # 7700 XT, opening cutscene (2026-11-26), three runs with against one without: 27-28 fps
@@ -97,6 +114,15 @@ if ($Console -eq 'series-s') {
     # written through a copy that does not share it (the log's line says how many).
     # -More @{VICTORY_CARD_PAGES='0'}: as before.
     $settings.VICTORY_CARD_PAGES = '1'
+    # The title's own upscaler (6) instead of FidelityFX (7), which the title picks on Series S:
+    # its FSR 4 pipelines come ready-made for the console's card and cannot be read here
+    # ("DeserializeComputePipelineStateX FAILED ... falling back"), and what the fallback gives
+    # is a dotted, pixelated picture (hair, shadow edges, anything the title dithers and leaves
+    # to the upscaler to smooth). The title's own smooths them; same render size (1280x720 to
+    # 1920x1080), same frame rate. -More @{VICTORY_UPSCALER='7'}: FidelityFX, as before.
+    # (Its render scale, VICTORY_RENDER_SCALE, ends the title at its start on this profile,
+    # as the other sizes do: 0.8 tried.)
+    $settings.VICTORY_UPSCALER = '6'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 

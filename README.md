@@ -85,11 +85,15 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+`-TextureStore` keeps the larger levels of the textures seen on disk
+(`%LOCALAPPDATA%\victory-7900xtx\texture-store`, 1.5 GB for three minutes of
+play, never trimmed) so that they are shown at once the next time.
 
 `scripts\start.ps1` is a menu (in French) in front of `play.ps1`: the console
 profile, the frame clock, the window, vsync and frame cap, the output size,
-anisotropic filtering, sharpening, the ambient light, ray tracing, the safe
-mode and the build. It keeps the choices in
+the upscaler, anisotropic filtering, sharpening, the
+texture store, the ambient light, ray tracing, the safe mode and the build.
+It keeps the choices in
 `%LOCALAPPDATA%\victory-7900xtx\start.json` (outside the repository) and
 `scripts\start.ps1 -Last` starts again with them.
 

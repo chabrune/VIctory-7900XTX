@@ -32,8 +32,14 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 /// Least bytes of the smaller levels a key is made of.
 pub(crate) const MIN_PREFIX: u64 = 32 << 10;
 /// Bytes of levels kept in memory at most (the rest is read from the folder
-/// when asked).
-const KEPT: u64 = 4 << 30;
+/// when asked): 4 GiB, or `VICTORY_TEXTURE_STORE_KEEP_MB` (0: none; a PC of
+/// 32 GB with the title's 25 GB in it has no 4 GiB to spare).
+fn kept_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_STORE_KEEP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(4 << 30, |mb| mb << 20)
+    })
+}
 
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
@@ -225,7 +231,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_most() {
         store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
         store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
     }
@@ -250,7 +256,7 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_most() {
                 store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
                 store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
             }

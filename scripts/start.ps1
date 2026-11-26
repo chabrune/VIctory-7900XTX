@@ -19,7 +19,9 @@ $s = [ordered]@{
     FpsLimit   = '0'
     Output     = 'jeu'
     Anisotropy = '16'
+    Upscaler   = '6'
     Sharpness  = '0.5'
+    TextureStore = '0'
     Ambient    = '0.8'
     RayTracing = '0'
     Safe       = '0'
@@ -58,7 +60,9 @@ $menu = @(
     @{ K = 'FpsLimit'; N = 'Limite d''images par seconde'; V = @(); H = '0 : aucune ; sinon un nombre (par ex. 30 pour une cadence régulière)' }
     @{ K = 'Output'; N = 'Résolution de sortie du jeu'; V = @('jeu', '1280x720', '1664x936', '1920x1080', '2560x1440', '3840x2160'); H = 'jeu : celle du profil (1080p en series-s, 4K en series-x). Autres tailles : expérimental, en series-s le jeu s''arrête au démarrage en 2560x1440' }
     @{ K = 'Anisotropy'; N = 'Filtrage anisotrope'; V = @('0', '2', '4', '8', '16'); H = '0 : ce que le jeu demande ; 16 : sols et murs plus nets de biais, sans coût mesuré' }
-    @{ K = 'Sharpness'; N = 'Netteté de la mise à l''échelle'; V = @(); H = 'de 0 (aucune) à 1 ; 0.5 conseillé' }
+    @{ K = 'Upscaler'; N = 'Mise à l''échelle de l''image'; V = @('6', '7'); H = '6 : celle du jeu, image lisse (conseillé) ; 7 : FidelityFX, ici en mode de secours : image en pointillés' }
+    @{ K = 'Sharpness'; N = 'Netteté (avec FidelityFX, la 7)'; V = @(); H = 'de 0 (aucune) à 1 ; 0.5 conseillé ; sans effet avec la mise à l''échelle du jeu' }
+    @{ K = 'TextureStore'; N = 'Magasin de textures sur disque'; V = @('0', '1'); H = '1 : les textures déjà vues s''affichent tout de suite en pleine définition la fois suivante ; prend environ 2 Go de mémoire vive en plus (à éviter avec 32 Go) et de la place sur le disque (1,5 Go pour trois minutes de jeu, dans %LOCALAPPDATA%\victory-7900xtx\texture-store, à effacer pour repartir de zéro)' }
     @{ K = 'Ambient'; N = 'Lumière ambiante estimée'; V = @(); H = '0 : sortie du jeu telle quelle ; 0.8 conseillé (intérieurs moins noirs sans ray tracing)' }
     @{ K = 'RayTracing'; N = 'Ray tracing du jeu'; V = @('0', '1'); H = '1 : éclairage indirect par rayons, intérieurs éclairés ; coûte environ la moitié des images (16-18 img/s sur RX 7700 XT)' }
     @{ K = 'Safe'; N = 'Mode sûr'; V = @('0', '1'); H = '1 : sans les chemins rapides récents, à essayer d''abord si quelque chose ne va pas' }
@@ -136,6 +140,7 @@ $more = @{
 if ([double]::Parse($s.Sharpness, [Globalization.CultureInfo]::InvariantCulture) -gt 0) { $more.VICTORY_FSR_SHARPNESS = $s.Sharpness } else { $more.VICTORY_FSR_SHARPNESS = '0' }
 if ($s.Clock -eq '60') { $more.VICTORY_FRAME_INTERVAL_MS = '16.667' }
 if ($s.Output -ne 'jeu') { $more.VICTORY_OUTPUT = $s.Output }
+$more.VICTORY_UPSCALER = $s.Upscaler
 foreach ($pair in ($s.Extra -split ',')) {
     $name, $value = $pair.Trim() -split '=', 2
     if ($name -and $null -ne $value) { $more[$name.Trim()] = $value.Trim() }
@@ -144,7 +149,8 @@ foreach ($pair in ($s.Extra -split ',')) {
 $arguments = @{ Exe = $s.Exe; Console = $s.Console; Build = $s.Build; More = $more }
 if ($s.RayTracing -eq '1') { $arguments.RayTracing = $true }
 if ($s.Safe -eq '1') { $arguments.Safe = $true }
+if ($s.TextureStore -eq '1') { $arguments.TextureStore = $true }
 Write-Host ''
-Write-Host "Lancement : profil $($s.Console), cadence $($s.Clock), fenêtre $($s.Window), anisotrope $($s.Anisotropy), ray tracing $($s.RayTracing)." -ForegroundColor Green
+Write-Host "Lancement : profil $($s.Console), cadence $($s.Clock), fenêtre $($s.Window), mise à l'échelle $($s.Upscaler), anisotrope $($s.Anisotropy), ray tracing $($s.RayTracing), magasin de textures $($s.TextureStore)." -ForegroundColor Green
 Write-Host '(Dans les menus du profil series-s, l''écran peut rester noir : appuyez sur Entrée ou A et le jeu continue.)'
 & (Join-Path $PSScriptRoot 'play.ps1') @arguments

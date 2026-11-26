@@ -160,17 +160,20 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size
+/// (`VICTORY_CAPTURE_FULL=1`: every pixel, to judge textures by).
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let step = if *FULL.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_FULL").is_some_and(|v| v == "1")) { 1 } else { 2 };
+    let (w, h) = ((width / step as u32).max(1), (height / step as u32).max(1));
+    // Filter byte 0 per row, then RGB of every pixel kept of every row kept.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
         raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
+        let row = &rows[(step * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
+            let p = &row[(step * x).min(width as usize - 1) * 4..][..3];
             if bgra {
                 raw.extend([p[2], p[1], p[0]]);
             } else {

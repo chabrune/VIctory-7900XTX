@@ -2236,6 +2236,120 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Diagnostics (`VICTORY_BARRIER_CENSUS=1`): what the title's barrier groups
+/// hold, read as the host's own structures (a group: kind, count, pointer;
+/// a global barrier: sync before and after, access before and after; a
+/// texture's: those, layout before and after, the resource, the
+/// subresources, flags; a buffer's: those four, the resource, offset, size).
+/// By (kind, sync before, sync after, access before, access after, layout
+/// before, layout after): how many; and the calls by what they hold. Said
+/// every 20,000 calls.
+///
+/// # Safety
+/// `groups` is `count` groups the title gave.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) unsafe fn groups_census(count: u32, groups: *const u8) {
+    use std::collections::HashMap;
+    type Census = (HashMap<[u32; 7], u64>, HashMap<[bool; 4], u64>, u64);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ALL: std::sync::Mutex<Option<Census>> = std::sync::Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_CENSUS").is_some_and(|v| v == "1")) {
+        return;
+    }
+    // The first calls as they come, word by word.
+    static RAW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 && !groups.is_null() {
+        // SAFETY: the caller's groups; 16 bytes each at least.
+        let head: Vec<String> = (0..8).map(|i| format!("{:#x}", unsafe { groups.add(i * 4).cast::<u32>().read_unaligned() })).collect();
+        // SAFETY: as above.
+        let at = unsafe { groups.add(8).cast::<usize>().read_unaligned() };
+        let committed = |at: usize| {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+            // SAFETY: zeroed is a valid value of it, and the call fills it.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a question about an address; the structure is ours.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+            n != 0 && info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && at + 64 <= info.BaseAddress as usize + info.RegionSize
+        };
+        let there: Vec<String> = if at > 0x10000 && at < 0x7fff_ffff_0000 && committed(at) {
+            // SAFETY: readable, as just asked.
+            (0..16).map(|i| format!("{:#x}", unsafe { ((at + i * 4) as *const u32).read_unaligned() })).collect()
+        } else {
+            Vec::new()
+        };
+        tracing::info!("a barrier group call of the title's: count {count}, the first words {head:?}, at its pointer {there:?}");
+    }
+    if groups.is_null() || count > 64 {
+        return;
+    }
+    let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+    let (kinds, calls, n) = all.get_or_insert_with(Default::default);
+    // What the call holds: a global barrier, a buffer's, a texture's that
+    // names unordered access before, a texture's that does not.
+    let mut holds = [false; 4];
+    for g in 0..count as usize {
+        // SAFETY: the caller's; a group is 16 bytes.
+        let (kind, barriers, at) = unsafe {
+            let group = groups.add(g * 16);
+            (group.cast::<u32>().read_unaligned(), group.add(4).cast::<u32>().read_unaligned(), group.add(8).cast::<usize>().read_unaligned())
+        };
+        if kind > 2 || barriers > 4096 || at == 0 {
+            *kinds.entry([u32::MAX, kind, barriers, 0, 0, 0, 0]).or_default() += 1;
+            continue;
+        }
+        let size = [16usize, 64, 40][kind as usize];
+        for b in 0..barriers as usize {
+            // SAFETY: the title's barriers of that kind.
+            let w: [u32; 6] = unsafe { std::array::from_fn(|i| ((at + b * size + i * 4) as *const u32).read_unaligned()) };
+            let (layouts, uav) = match kind {
+                1 => ([w[4], w[5]], w[2] & 0x10 != 0),
+                _ => ([0, 0], false),
+            };
+            *kinds.entry([kind, w[0], w[1], w[2], w[3], layouts[0], layouts[1]]).or_default() += 1;
+            holds[match kind {
+                0 => 0,
+                2 => 1,
+                _ if uav => 2,
+                _ => 3,
+            }] = true;
+        }
+    }
+    *calls.entry(holds).or_default() += 1;
+    *n += 1;
+    if (*n).is_multiple_of(20_000) {
+        let mut by: Vec<_> = kinds.iter().collect();
+        by.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        let lines: Vec<String> = by
+            .iter()
+            .take(28)
+            .map(|(k, n)| {
+                format!(
+                    "{n}x {} sync {:#x}->{:#x} access {:#x}->{:#x} layout {:#x}->{:#x}",
+                    ["global", "texture", "buffer"].get(k[0] as usize).copied().unwrap_or("not read"),
+                    k[1],
+                    k[2],
+                    k[3],
+                    k[4],
+                    k[5],
+                    k[6]
+                )
+            })
+            .collect();
+        let mut held: Vec<_> = calls.iter().collect();
+        held.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        let held: Vec<String> = held
+            .iter()
+            .map(|(h, n)| {
+                let what: Vec<&str> = ["global", "buffer", "texture written by shaders before", "texture otherwise"].iter().zip(h.iter()).filter(|(_, on)| **on).map(|(w, _)| *w).collect();
+                format!("{n} calls with [{}]", what.join(", "))
+            })
+            .collect();
+        tracing::info!("the title's barrier groups, {} calls: {}; barriers: {}", *n, held.join("; "), lines.join("; "));
+        kinds.clear();
+        calls.clear();
+    }
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -2246,6 +2360,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        // SAFETY: the title's groups, as it gave them.
+        unsafe { groups_census(count, _groups) };
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
