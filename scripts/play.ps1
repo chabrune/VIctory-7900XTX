@@ -80,6 +80,14 @@ if ($Console -eq 'series-s') {
     # ground and walls seen at an angle, at no frame rate cost here (34 fps, the card 26.6 ms
     # a frame, with and without). -More @{VICTORY_ANISOTROPY='0'}: what the title asks.
     $settings.VICTORY_ANISOTROPY = '16'
+    # Renderer ports 6 and 7 of avatarmanz/VIctory-7900XTX: the write guards' lock shared by
+    # faults and refreshes, and the heaps' records' notes in parts with locks of their own. RX
+    # 7700 XT, opening cutscene, the clock at 60 Hz (2026-11-26), with the two above: the
+    # preparing thread 26-27 ms a frame against 28.1, 34.5-35 fps against 34 (the card, 25.7 ms
+    # a frame, is what the frame waits for). -More @{VICTORY_PORT_GUARD='0';
+    # VICTORY_PORT_JOURNAL='0'}: as before.
+    $settings.VICTORY_PORT_GUARD = '1'
+    $settings.VICTORY_PORT_JOURNAL = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
