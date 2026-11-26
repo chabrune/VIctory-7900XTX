@@ -469,6 +469,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -625,6 +626,42 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], co
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(color, 1), bytes_of(rects, count as usize)],
     );
 }
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, cpu, resource, values, false, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, cpu, resource, values.cast(), true, count, rects);
+}
+/// The view's record is copied, as a render target clear's is: its slot may
+/// be written again before the call is translated.
+fn clear_uav(this: This, cpu: u64, resource: This, values: *const [u32; 4], float: bool, count: u32, rects: *const Rect) {
+    if cpu == 0 || values.is_null() {
+        return;
+    }
+    let count = if rects.is_null() { 0 } else { count };
+    let view = record(cpu);
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count), u64::from(float), resource as u64],
+        &[bytes_of(view.as_ptr(), RECORD), bytes_of(values, 1), bytes_of(rects, count as usize)],
+    );
+}
 extern "system" fn clear_dsv(
     this: This,
     handle: u64,
@@ -755,6 +792,17 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 1 + RECORD + 2, n),
                 );
             }
+            CLEAR_UAV => {
+                super::clear_uav(
+                    list,
+                    w[3..].as_ptr() as u64,
+                    w[2] as This,
+                    at_or(w, 3 + RECORD),
+                    w[1] != 0,
+                    n as u32,
+                    at(w, 3 + RECORD + 2, n),
+                );
+            }
             CLEAR_DSV => {
                 super::clear_dsv(
                     list,
@@ -802,7 +850,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -838,6 +886,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
