@@ -196,11 +196,32 @@ chain (12.7 ms a frame, one frame in four all of it); the title's own commands t
 the submitting thread works 32 to 35 ms. The lines the frame meter logged once a second
 took 16.8 ms of the frame they fell in; they are written by a thread of their own now.
 
+## The queue of textures picked by index, in parts, 2026-11-26
+
+The submitting thread stands blocked for 40 % of its wait on one lock: the queue of
+slots whose texture view waits to be brought up to date (`descriptor::host::TextureQueue`),
+which the threads that translate lists take for every texture view they write (4.9 ms of
+a 33 ms frame). It is now in 16 parts, each with a lock of its own, by slot
+(`VICTORY_TEXTURE_SHARDS`; 1: one lock for all of it, as before).
+
+What does not change is the order textures are served in: `due` picks them by the
+number of their write, and that number comes from one counter over all the parts, so
+the newest-first/oldest-next turns of the backlog come out as before (the tests of the
+queue, `the_texture_queue_serves_the_newest_writes_first` among them, run on the parts).
+What changes is who waits for whom: two threads writing slots of different parts no
+longer wait for each other, and the pass that takes the due slots once a frame locks
+each part in turn instead of the one lock every write of the frame went through. A bulk
+look at a list of slots (a page written under a texture) is one lock a part, not one a
+slot.
+
+Not measured yet on the title: `VICTORY_TEXTURE_SHARDS=1` is the A/B of the same run.
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask
    for the next submission while this one is sent; view the card's own buffers where fills
-   copy them now.
+   copy them now. (The queue of textures picked by index no longer has one lock for the
+   frame: see above.)
 2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
    after fxceless c36971b2; not measured here yet), and the passes that run for nothing
    without rays.
