@@ -79,6 +79,67 @@ in that order of size:
 - An on-screen panel of numbers (`VICTORY_PANEL`): it helps finding where a frame goes but
   costs some, so it is off and F3 shows it.
 
+## Pipelines the title has ready-made (device methods 0x1c8 and 0x218), 2026-11-26
+
+Read on an RX 7700 XT, Series S profile, from 96 descriptions of each method written
+down with `VICTORY_PIPELINE_DUMP=<folder>` (a diagnostics build; the folder outside the
+repository). In 47 s of the opening the title asks 0x1c8 for 10,277 different pipelines
+and 0x218 for 2,690.
+
+**What they are.** Pipelines whose programs the console's compiler made ahead of time,
+handed over in pieces instead of a shader container. The pieces are those of the `FSPX`
+that an `ACCC` part holds (`victory_shader::native::fspx_program`). When a method
+answers that it is not there, the title makes the same pipeline from containers, which
+is how every run so far drew: these calls are not missing pictures.
+
+**0x218, compute**, 12 words of 8 bytes: the root signature object; then four pieces as
+pointer and length: the pipeline's registers (0x1c bytes: thread-group size as three
+u16 at +0x0c, flags at +0x12, `COMPUTE_PGM_RSRC1` and `2` at +0x14 and +0x18), a note
+about the pipeline (0x14 bytes, a hash first), the GFX10 code, the program's metadata
+(0x403, size - 0x14, code dwords, then 32-byte records 0x41/0x42/0x43 from +0x18); then
+three words of the title's own (two descriptions it is linked with, a hash).
+
+**0x1c8, graphics**, 13 words: the root signature object, a block of registers (0x17c,
+0x184 or 0x18c bytes), a note about the pipeline (0x78 to 0xbc bytes, with the input
+layout: element count, then semantic names such as POSITION, COLOR, TEXCOORD and
+formats), then code and metadata of the pixel program (null for depth-only pipelines)
+and of the vertex program. A stage's metadata: u32 2, size - 0xc, code dwords, u8 0x40,
+u8 first user-data dword (bit 7 set for the vertex stage), u8 count of 0x41 records,
+then the same 32-byte records from +0x10.
+
+The register block, as far as it is read (offsets in bytes, values little-endian):
+
+| Offset | What | How it was told |
+|---|---|---|
+| 0x028 | low half 0x11c, high half the block's length - 0x138 | 0x44, 0x4c, 0x54 for the three lengths |
+| 0x038, 0x03c | `SPI_SHADER_PGM_RSRC1/2` of the vertex stage | as the compute block's |
+| 0x04c, 0x050 | the same of the pixel stage (zero without one) | |
+| 0x05c | interpolants the pixel stage takes (1 to 4) | 0x084 is (that - 1) * 2: `SPI_VS_OUT_CONFIG` |
+| 0x07c | `CB_COLOR_CONTROL` (0x00cc0010; mode 0 without a pixel stage) | ROP3 0xcc |
+| 0x0a0 | `PA_SU_SC_MODE_CNTL` (0x00201a40; bit 1: back faces culled) | |
+| 0x0b8 | `DB_DEPTH_CONTROL` (0x007007f0 no depth test, ...f6 depth written always, ...7b3 stencil and less-or-equal) | |
+| 0x0bc | `DB_STENCIL_CONTROL` | |
+| 0x0c0, 0x0c4 | `DB_STENCILREFMASK` front and back (0x0100ff00) | |
+| 0x0d0-0x0ec | `CB_BLEND0..7_CONTROL` (0xe5010504: source alpha, inverse source alpha) | eight alike |
+| 0x100-0x11c | `SX_MRT0..7_BLEND_OPT`, which follow from the blend | one value per blend value |
+
+Not found yet in either block: the render target and depth formats, the sample count,
+the primitive topology (the words from 0x138 on and the note's first words are the
+candidates).
+
+**State.** 0x218 is written (`VICTORY_PIPELINE_PARTS=1`, off by default): the pieces
+are put in a container the translator already reads. With it on, over a thousand
+pipelines were made in the opening and the picture was black: 1,065 dispatches a frame
+dropped, because more than half of those programs do not translate from their pieces.
+A container's program record says which root parameter each user-data word is; the
+pieces do not, and the translator's `FSPX` reader takes only what the upscaler's
+programs need (tables and root descriptors, one word or two each). What is missing,
+for both methods: the root parameters from the root signature the description names.
+0x1c8 needs, beyond that, the stage programs' inputs and outputs and the host state
+from the registers above. Nothing is gained on the picture by either; whether the
+title's own way round costs frames (a pipeline asked for again and again) is not
+measured.
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask

@@ -398,7 +398,33 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     unknown_pipeline_census(SLOT, desc);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    unknown_pipeline_dump(SLOT, desc);
     E_NOTIMPL
+}
+
+/// Device method 0x218: a compute pipeline from a program's pieces
+/// (`crate::pipeline::ComputeParts`) with `VICTORY_PIPELINE_PARTS=1`;
+/// otherwise, and if the pieces are not understood, as an unknown method
+/// answers.
+extern "system" fn compute_parts(
+    this: This,
+    desc: *const crate::pipeline::ComputeParts,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if crate::pipeline::parts_on()
+        && let Some(hr) = crate::pipeline::create_compute_parts(desc, iid, out)
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let made = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        if made.is_power_of_two() {
+            tracing::info!(made, hr, "compute pipelines made from programs' pieces (device method 0x218)");
+        }
+        return hr;
+    }
+    unknown_pipeline::<0x218>(this, desc.cast(), iid, out)
 }
 
 /// Diagnostics: how many different pipelines the title asks of the two
@@ -446,6 +472,75 @@ fn unknown_pipeline_census(slot: usize, desc: *const u8) {
         );
         census.calls = [0, 0];
         census.since = Some(std::time::Instant::now());
+    }
+}
+
+/// Diagnostics: with `VICTORY_PIPELINE_DUMP=<folder>` (outside the
+/// repository), what the title hands the two methods above is written down
+/// for the first 96 different descriptions of each, one file a description
+/// (`p-<slot>-<n>.bin`), so that their layout can be worked out: pieces of a
+/// tag (u32), a length (u32) and the bytes. Tag 0 is the description's first
+/// 128 bytes; 1 to 8 what its words 1, 3, 5, 7, 9 and 11 point at, as long as
+/// the word after each says (for 0x218 words 9 and 10 have no length: 256
+/// bytes each); 9 the first 128 bytes of the object word 0 names, and 10
+/// what that object's fourth word points at, as long as its third says (a
+/// root signature of ours and the bytes the title made it from).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn unknown_pipeline_dump(slot: usize, desc: *const u8) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static SEEN: Mutex<Option<[HashSet<[u64; 3]>; 2]>> = Mutex::new(None);
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_PIPELINE_DUMP")?);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }) else {
+        return;
+    };
+    let read = |at: u64, len: usize| -> Option<Vec<u8>> {
+        let mut bytes = vec![0u8; len];
+        (at != 0 && len != 0 && len <= 1 << 20 && crate::host::read_into(at as *const u8, &mut bytes)).then_some(bytes)
+    };
+    let Some(head) = read(desc as u64, 128) else {
+        return;
+    };
+    let word = |bytes: &[u8], i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let which = usize::from(slot == 0x218);
+    let key = if which == 1 { [word(&head, 5), word(&head, 11), word(&head, 6)] } else { [word(&head, 5), word(&head, 9), word(&head, 6)] };
+    let number = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = &mut seen.get_or_insert_with(|| [HashSet::new(), HashSet::new()])[which];
+        if seen.len() >= 96 || !seen.insert(key) {
+            return;
+        }
+        seen.len()
+    };
+    let mut out = Vec::new();
+    let mut put = |tag: u32, bytes: Option<Vec<u8>>| {
+        if let Some(bytes) = bytes {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+    };
+    let sized = |i: usize| read(word(&head, i), word(&head, i + 1) as usize);
+    let pieces: [(u32, Option<Vec<u8>>); 6] = if which == 1 {
+        [(1, sized(1)), (2, sized(3)), (3, sized(5)), (4, sized(7)), (7, read(word(&head, 9), 256)), (8, read(word(&head, 10), 256))]
+    } else {
+        [(1, sized(1)), (2, sized(3)), (3, sized(5)), (4, sized(7)), (5, sized(9)), (6, sized(11))]
+    };
+    let object = read(word(&head, 0), 128);
+    let made_from = object.as_ref().and_then(|o| read(word(o, 3), word(o, 2) as usize));
+    put(0, Some(head.clone()));
+    for (tag, bytes) in pieces {
+        put(tag, bytes);
+    }
+    put(9, object);
+    put(10, made_from);
+    let file = dir.join(format!("p-{slot:x}-{number:03}.bin"));
+    if let Err(e) = std::fs::write(&file, out) {
+        tracing::warn!(error = %e, file = %file.display(), "a pipeline description was not written down");
     }
 }
 
@@ -502,7 +597,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = compute_parts as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

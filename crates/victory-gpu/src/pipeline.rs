@@ -648,6 +648,131 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// What device method 0x218 is given: a compute pipeline from the pieces of
+/// a program the console's compiler made ahead of time, where the other
+/// methods are given a shader container. The pieces are those an `ACCC`
+/// part's `FSPX` holds (`victory_shader::native::fspx_program`): the
+/// pipeline's registers (kind 0, 0x1c bytes), what is said about the pipeline
+/// (kind 1, 0x14 bytes), the code (kind 6) and what is said about the program
+/// (kind 7), each a pointer and a length. Read from 96 descriptions the title
+/// passed (an RX 7700 XT, Series S profile, 2026-11-26): every one had these
+/// lengths, a kind 7 beginning 0x403 and a code length that agrees with it.
+/// After them the title keeps words of its own (two descriptions it links
+/// this one with, a hash).
+#[repr(C)]
+pub(crate) struct ComputeParts {
+    root: This,
+    pieces: [Bytecode; 4],
+}
+
+/// The kinds of the `FSPX` entries [`ComputeParts::pieces`] are, in order.
+const PARTS_KINDS: [u32; 4] = [0, 1, 6, 7];
+
+/// Whether pipelines are made from programs' pieces (device method 0x218):
+/// `VICTORY_PIPELINE_PARTS=1`, off by default. Without it the method answers
+/// that it is not there, as an unknown one does, and the title makes the same
+/// pipelines from shader containers instead, which is how every run so far
+/// drew. With it (run e1, an RX 7700 XT, Series S profile, 2026-11-26) the
+/// title got its pipelines here, over a thousand in the opening, and the
+/// picture was black: 1,065 dispatches a frame were dropped, because more
+/// than half of those programs do not translate from their pieces ("an
+/// address not from a root parameter", "an address with two computed terms",
+/// stores of some channels). What a container's program record says of the
+/// root parameters is not among the pieces; it has to come from the root
+/// signature the description names, and [`victory_shader::native::fspx_program`]
+/// takes only what the upscaler's programs need.
+pub(crate) fn parts_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_PARTS").is_some_and(|v| v == "1"))
+}
+
+/// `len` bytes of title memory at `at`, if they are there.
+fn piece(code: &Bytecode) -> Option<Vec<u8>> {
+    // (A program's code is a few KiB; its other pieces less.)
+    if code.code.is_null() || code.size == 0 || code.size > 4 << 20 {
+        return None;
+    }
+    let mut bytes = vec![0u8; code.size];
+    #[cfg(windows)]
+    let there = crate::host::read_into(code.code, &mut bytes);
+    #[cfg(not(windows))]
+    let there = {
+        // SAFETY: the title passes `size` bytes.
+        bytes.copy_from_slice(unsafe { std::slice::from_raw_parts(code.code, code.size) });
+        true
+    };
+    there.then_some(bytes)
+}
+
+/// An `FSPX` of `pieces` ([`PARTS_KINDS`]), as an `ACCC` part holds it: the
+/// name, version 1, the entry count and the size, then 16 bytes an entry
+/// (kind, offset, size, zero) and the pieces, each on four bytes.
+fn fspx_of(pieces: &[Vec<u8>; 4]) -> Vec<u8> {
+    let head = 0x10 + 16 * pieces.len();
+    let total = head + pieces.iter().map(|p| p.len().next_multiple_of(4)).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"FSPX");
+    for word in [1, pieces.len() as u32, total as u32] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut at = head;
+    for (kind, piece) in PARTS_KINDS.iter().zip(pieces) {
+        for word in [*kind, at as u32, piece.len() as u32, 0] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        at += piece.len().next_multiple_of(4);
+    }
+    for piece in pieces {
+        out.extend_from_slice(piece);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    out
+}
+
+/// A shader container whose one part is `fspx`, as the compiler's own
+/// containers of such programs have it (`ACCC`).
+fn container_of(fspx: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 0x20;
+    let total = HEADER + 4 + 8 + fspx.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"DXBC");
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&((HEADER + 4) as u32).to_le_bytes());
+    out.extend_from_slice(b"ACCC");
+    out.extend_from_slice(&(fspx.len() as u32).to_le_bytes());
+    out.extend_from_slice(fspx);
+    out
+}
+
+/// The container that stands for the program a description of device method
+/// 0x218 names; `None` if its pieces are not there or are not a compute
+/// program as [`victory_shader::native_programs`] reads one.
+fn compute_parts_container(desc: &ComputeParts) -> Option<Vec<u8>> {
+    let pieces = [piece(&desc.pieces[0])?, piece(&desc.pieces[1])?, piece(&desc.pieces[2])?, piece(&desc.pieces[3])?];
+    let fspx = fspx_of(&pieces);
+    let programs = victory_shader::native_programs(&fspx).ok()?;
+    matches!(programs.as_slice(), [p] if p.stage == victory_shader::HwStage::Cs).then(|| container_of(&fspx))
+}
+
+/// Device method 0x218 ([`ComputeParts`]): `None` if the description is not
+/// understood (the caller answers as for an unknown method).
+pub(crate) fn create_compute_parts(desc: *const ComputeParts, iid: *const Iid, out: *mut This) -> Option<HRESULT> {
+    // SAFETY: the title passes a description (null is tolerated).
+    let desc = unsafe { desc.as_ref() }?;
+    let container = compute_parts_container(desc)?;
+    Some(hand_out(
+        vec![shader("compute", &container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    ))
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
