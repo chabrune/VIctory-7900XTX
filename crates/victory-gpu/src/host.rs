@@ -7020,7 +7020,10 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        // (Cut from a block: the list writes it before anything reads it,
+        // and of its own the card gives it a multiple of 256 KiB.)
+        let host = host()?;
+        let buffer = crate::pool::scratch_buffer(&host.device, alloc).or_else(|| host.uav_buffer(alloc))?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -7042,7 +7045,8 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
+            let host = host()?;
+            let made = crate::pool::scratch_buffer(&host.device, size).or_else(|| host.uav_buffer(size))?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }

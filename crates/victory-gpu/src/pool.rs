@@ -528,8 +528,25 @@ pub(crate) fn used_before(buffer: &ID3D12Resource) -> bool {
 
 /// A buffer of at least `size` bytes with unordered access in a block of the
 /// card's memory, in the common state; `None`: not pooled (too big for half
-/// a block, or the switch is off), or the host refused.
+/// a block, or the switch is off), or the host refused. What it holds at
+/// first is zeros or what another buffer left there ([`used_before`] says
+/// which, once).
 pub(crate) fn card_buffer(device: &ID3D12Device, size: u64) -> Option<ID3D12Resource> {
+    let (made, again) = cut_buffer(device, size)?;
+    if again {
+        lock(&USED_BEFORE).push(made.as_raw() as usize);
+    }
+    Some(made)
+}
+
+/// [`card_buffer`] for memory that is written before it is read (a list's
+/// scratch for indirect arguments): nothing is kept about what it held.
+pub(crate) fn scratch_buffer(device: &ID3D12Device, size: u64) -> Option<ID3D12Resource> {
+    cut_buffer(device, size).map(|(made, _)| made)
+}
+
+/// The buffer and whether its part of the block was used before.
+fn cut_buffer(device: &ID3D12Device, size: u64) -> Option<(ID3D12Resource, bool)> {
     if !buffers_on() {
         return None;
     }
@@ -575,10 +592,7 @@ pub(crate) fn card_buffer(device: &ID3D12Device, size: u64) -> Option<ID3D12Reso
             BUFFERS_HELD[0].fetch_add(piece.len, Ordering::Relaxed);
             BUFFERS_HELD[1].fetch_add(1, Ordering::Relaxed);
             give_back_with(&made, piece, true);
-            if again {
-                lock(&USED_BEFORE).push(made.as_raw() as usize);
-            }
-            Some(made)
+            Some((made, again))
         }
         (result, _) => {
             if let Err(e) = result {
