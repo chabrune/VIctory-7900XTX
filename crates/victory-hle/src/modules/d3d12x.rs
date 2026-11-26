@@ -32,6 +32,7 @@ fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
     const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
+    victory_core::logging::flush();
     // SAFETY: ends our own process.
     unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
     unreachable!("the process has ended")

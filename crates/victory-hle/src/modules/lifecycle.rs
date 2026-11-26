@@ -484,6 +484,7 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    victory_core::logging::flush();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
