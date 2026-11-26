@@ -46,10 +46,36 @@ pub(crate) fn in_place_on() -> bool {
     on() && crate::toggled!("VICTORY_PORT_CBV_PLACE")
 }
 
+/// Whether a table's constant buffer in memory that a host copy shaders
+/// write holds is read in that copy, as its other views are (on with the
+/// port; `VICTORY_PORT_CBV_COPIES=0`: copied out of title memory at
+/// submission, as before; with `VICTORY_AB` by turns).
+///
+/// Why: the copy at submission reads title memory on the CPU, and what the
+/// card writes there is not in title memory while the submissions that
+/// write it are in the air. With the title's ray tracing on, one such
+/// constant buffer a frame (176 to 240 bytes: in a buffer shaders are
+/// declared to write whole, or the destination of a buffer copy the list
+/// does at its place) stood the submitting thread still until the card had
+/// run everything sent before, 4 to 37 ms a frame (runs rt-trace3,
+/// rt-placed, 2026-11-26); the steps on the card refuse it where that copy
+/// stands in the same submission. Read in the host copy, the bytes are
+/// those the card has at the draw, in the list's order, and the title's own
+/// writes go up with the copy's refresh like those of any buffer view.
+pub(crate) fn copies_on() -> bool {
+    on() && crate::toggled!("VICTORY_PORT_CBV_COPIES")
+}
+
 /// Since the last line: tables' constant buffers given in place, their bytes;
 /// copied as before because not in place, because not on 16 bytes; title
-/// slots' constant buffers whose twin is a raw view.
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// slots' constant buffers whose twin is a raw view; tables' constant buffers
+/// read in a host copy shaders write.
+static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// A table's constant buffer is read in the host copy shaders write.
+pub(crate) fn in_copy() {
+    STATS[5].fetch_add(1, Relaxed);
+}
 
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
@@ -82,12 +108,13 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
     tracing::info!(
         "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
-         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",
+         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin;          {:.1} read in a host copy shaders write (VICTORY_PORT_CBV_COPIES)",
         s[0],
         s[1] / 1024.0,
         s[2],
         s[3],
         s[4],
+        s[5],
     );
 }
 

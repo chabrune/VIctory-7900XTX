@@ -3793,6 +3793,17 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
+                        // In a host copy shaders write (or a copy of the
+                        // title's at its place in a list): read there, as
+                        // every other view of that copy is.
+                        if crate::port_cbv::copies_on()
+                            && let Some(shadow) = crate::shadow::peek(address, u64::from(size)).filter(|s| s.written() && !s.in_place())
+                            && host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size)
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            crate::port_cbv::in_copy();
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
