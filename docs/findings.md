@@ -261,6 +261,44 @@ composed, a guard on the PC's memory, XMA corrections, NVIDIA lowering), built a
 here with its launcher's settings: 13 fps in the same scene, then 5 (the card waited for
 50, then 176 ms a frame: 11.8 GB of textures uploaded on a 12 GB card).
 
+## Past 30: the wall is the card now (2026-11-26, later)
+
+With the clock at 60 Hz (`VICTORY_FRAME_US=16667`) the opening cutscene runs at 30 to 31
+fps, and what a frame waits for has changed. A timeline of 40 frames (35.1 ms each): the
+card running submissions 11.5 ms of the chain, the thread that prepares them 4.9, the
+title's own 3.6, the heaps' records 2.4, the landing 1.4. The card's own stamps
+(`VICTORY_CARD_SPANS=1`): working 29.0 ms a frame, idle 3.8: busy 88 % of the frame.
+
+**What the card's time is** (`VICTORY_GPU_TIMING=1`, each command timed alone, so the sum
+is over what a frame takes): 34.4 ms in 8,700 commands a frame: dispatches 15.4 ms in
+3,111, indirect commands 13.6 ms in 4,730 (compute and mesh), mesh draws 2.2 in 350, the
+alias copies 1.4 in 77, draws 1.3 in 290. The forty heaviest are 18 ms, compute nearly all
+of it: `indirect [compute 919bafe017d59512]` 2.67 ms in one call (253 blocks, 69 handles
+made from the heap, 35 samples, 61 raw buffer loads), `dispatch [compute
+39f0e9aeb156a61c]` 2.39, `7a071f906f98311b` 1.08, `34fb51b8a0312e82` 0.85. Drawing the
+scene's 4,400 meshes is under 4 ms. 720p for 29 ms is some 31 ns a pixel; a PC game of this
+kind on this card takes a fifth of that.
+
+**The title is told the card does nothing.** It asks for four timestamps a frame in pairs
+and all are written when the frame's last submissions land. `VICTORY_GPU_LOAD_MS=30` (the
+pairs 30 ms apart): the card's work the same 29.6 ms, so it does not size its picture by
+them here.
+
+**The heap.** Our own code asks the heap for 29,500 blocks a frame and makes 7,200 over at
+another size: two million calls a second on the one heap of the process, 11.7 % of the
+time the preparing thread runs (profile p2), 8 % of the landing's. Blocks of a megabyte and
+less are now kept by the thread that lets them go for its next ones (`crate::heap`,
+`VICTORY_HEAP=system`: as before): 27,500 of 36,400 a frame answered without the system;
+that thread 30.1 ms a frame against 30.9. (mimalloc was the first thought: not fetched
+without the owner's word.)
+
+**Who touches the blocks only shaders write** (`VICTORY_ALLOC_KEPT=1`: the blocks of the
+title's general allocator are kept from the CPU until something touches them). Of seven,
+two are written at once by the title, four (8, 16, 16, 8 MB) by nothing in 170 s, and the
+20 MB one is first read 37 s after it was made by the landing that fetches it back: 21 MB
+a frame brought down for nobody. (We wrote zeros over each of them when it was made, over
+the system's own zeros: not any more.)
+
 ## What the translated shaders are made of (2026-11-26)
 
 The title's own containers are written down as it uses them:
@@ -300,27 +338,36 @@ default; part of the translation, so the shader cache keys on it.
 host. A run takes the RDNA ones, where a legacy product is the `fmin`, a
 compare and a select; the three instructions are the same either way.)
 
-## What is next
+## What is next: the three walls to 60 and beyond
 
-1. Past 30: the preparing thread works 31 ms a frame (asking the write watch 4.7,
-   refreshes 8.3 of which 9,400 of 10,600 copy nothing, copies and fills 2.7, copies in the
-   card's memory 2.3). One preparation for all the parts of one call of the title's, done
-   when it calls and beside the thread that sends, is the shape that halves it; what
-   shaders write not fetched back until something on the CPU reads it takes the landing's
-   19 ms of other threads; then the card's own 28 ms (the translated programs are 2.4 times
-   the console's instructions).
-2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
-   after fxceless c36971b2; not measured here yet), and the passes that run for nothing
-   without rays.
-3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
-   pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
-   (The ~830 MB the small buffers of their own gave back are enough for 2 GiB of the
-   title's windows in card memory beside the same textures: not measured yet.)
-4. Outdoor flicker: suspected to be one bad indirect record that uses up its list's
-   budget, so that every later draw of it is empty. The log's frame line counts them;
-   `VICTORY_INDIRECT_REST=0` is the experiment.
-5. Memory, 40-46 GB private: lists' allocators 9 GB, windows 7, uploads 4
-   (`VICTORY_MEMORY_MAP=1` lists it).
+In the order the measurements put them (an RX 7700 XT; each has to come down by about
+half for 60 frames a second, and all three stand at about 30 ms now).
+
+1. **The card, 29 ms a frame.** Four fifths of it is the title's compute. To look at, the
+   heaviest first: what the forty costliest programs do in their host form against the
+   console's (handles made from the heap inside loops, loads of four dwords for one, the
+   wave's first lane read for what is one value), and what they read from the PC's memory
+   over the bus (renderer port 1 puts the constants there; a program run a million times
+   a frame reads them each time). Then the 3,000 small dispatches (skinning, culling),
+   7 ms: what stands between two of them on the host that does not on the console (689
+   waits for every earlier shader write a frame). The alias copies, 1.4 ms: one texture
+   with two views needs formats the host may cast between (R32_UINT and R9G9B9E5 are not
+   of one family; relaxed casting at creation, `CreateCommittedResource3`).
+2. **The thread that prepares submissions, 30 ms a frame.** One preparation for all the
+   parts of one call of the title's, begun when it calls and beside the thread that sends
+   (the heaps' records are asked for that way already): the write watch asked once a call
+   (4.7 ms in 15 askings now), the refreshes flushed once (8.3 ms in 30 flushes, 9,400 of
+   10,600 spans copying nothing).
+3. **What goes back to the PC's memory, 69 MB a frame, 19 ms of the landing threads.**
+   43 MB of it is of copies nothing is ever sent up to. Memory with an owner: what only
+   shaders write stays the card's, its pages kept from the CPU, and is fetched when
+   something touches it (`VICTORY_ALLOC_KEPT` is the detector; the fetch at the fault is
+   what is missing, and the landing path that brings the 20 MB buffer down is not the
+   relay's `relay_card_back` loop, where the first skip was put: 0 pieces left there).
+
+Smaller: outdoor flicker (one indirect record that uses up its list's budget:
+`VICTORY_INDIRECT_REST=0`); stalls while pipelines are made (`victory warm`); the PC's
+memory, 24 to 25 GB private with 2 to 2.6 GB free.
 
 ## The other repositories, compared
 
