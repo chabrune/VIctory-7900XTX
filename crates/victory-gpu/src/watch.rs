@@ -2223,6 +2223,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     crate::inplace::blocks_opening(at, len);
+    crate::host::owner::opening(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2769,7 +2770,16 @@ pub(crate) fn install() {
         if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.NumberParameters >= 2
             && r.ExceptionInformation[0] <= WRITE
-            && crate::inplace::block_fault(r.ExceptionInformation[1], r.ExceptionInformation[0] as u8, r.ExceptionAddress as usize, ours.is_some())
+            && (crate::inplace::block_fault(r.ExceptionInformation[1], r.ExceptionInformation[0] as u8, r.ExceptionAddress as usize, ours.is_some())
+                // Or a copy that is the card's alone: brought down, and opened.
+                || crate::host::owner::fault(
+                    r.ExceptionInformation[1],
+                    r.ExceptionInformation[0] as u8,
+                    r.ExceptionAddress as usize,
+                    ours.is_some(),
+                    // SAFETY: the context the system passes.
+                    unsafe { (*context).Rsp } as usize,
+                ))
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }

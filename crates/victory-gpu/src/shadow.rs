@@ -102,6 +102,14 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Whether the copy's bytes are the card's alone: one of the states of
+    /// `crate::host::owner`.
+    owned: AtomicU8,
+    /// Whether that was asked for the copy (once).
+    owner_asked: std::sync::atomic::AtomicBool,
+    /// How many of our threads are reading the copy's title memory now
+    /// ([`Shadow::reading`]): the card takes the copy when none is.
+    readers: std::sync::atomic::AtomicU32,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2690,8 +2698,22 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// A read of a copy's title memory by code of ours, going on
+/// ([`Shadow::reading`]).
+struct Reading<'a>(&'a Shadow);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        self.0.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // The card's alone: brought down before its buffer goes.
+        if self.owned.load(Ordering::Relaxed) == crate::host::owner::OWNED {
+            crate::host::owner::dropped(self);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3102,6 +3124,74 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// Whether the copy's bytes are the card's alone now (`crate::host::owner`):
+    /// title memory there is kept from the CPU, so it holds nothing newer
+    /// than the card and nothing of it is to be read.
+    #[inline]
+    pub(crate) fn card_owned(&self) -> bool {
+        matches!(self.owned.load(Ordering::Relaxed), crate::host::owner::OWNED | crate::host::owner::FETCHING | crate::host::owner::SEALING)
+    }
+
+    /// The state of that.
+    pub(crate) fn owner(&self) -> &AtomicU8 {
+        &self.owned
+    }
+
+    /// For a read of the copy's title memory by code of ours: `None` if the
+    /// copy is the card's alone (there is nothing to read then); else the
+    /// copy is not taken by the card until what this returns is dropped
+    /// (the taking waits for the readers it finds, and a reader looks at
+    /// the state after it has counted itself).
+    fn reading(&self) -> Option<Reading<'_>> {
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.owned.load(Ordering::SeqCst), crate::host::owner::OWNED | crate::host::owner::FETCHING | crate::host::owner::SEALING) {
+            self.readers.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Reading(self))
+    }
+
+    /// How many are reading it now.
+    pub(crate) fn readers(&self) -> u32 {
+        self.readers.load(Ordering::SeqCst)
+    }
+
+    /// Whether nobody asked yet if the card may own the copy: true once.
+    pub(crate) fn owner_unasked(&self) -> bool {
+        !self.owner_asked.swap(true, Ordering::Relaxed)
+    }
+
+    /// Whether the copy is of the kind the card may own: a title buffer of
+    /// `least` bytes and more with a side in the card's memory, in memory the
+    /// kernel watches.
+    pub(crate) fn ownable(&self, least: u64) -> bool {
+        self.card.is_some() && self.place.is_none() && !self.window && !self.mapped && self.len >= least && self.watched.load(Ordering::Relaxed) == 1
+    }
+
+    /// The pages of title memory the copy lies in: the first one's address,
+    /// and their bytes.
+    pub(crate) fn pages(&self) -> (usize, usize) {
+        let first = self.start as usize & !(KERNEL_PAGE - 1);
+        (first, ((self.start + self.len) as usize - first).next_multiple_of(KERNEL_PAGE))
+    }
+
+    /// The copy's bytes as the card held them (at `from`, as many as the
+    /// copy has) go into title memory, whose pages the caller has opened,
+    /// and into the CPU's side; they are noted as a landing's, which the next
+    /// refresh compares and sends nothing of.
+    ///
+    /// # Safety
+    /// `from` holds the copy's bytes, and the copy's pages can be written.
+    pub(crate) unsafe fn opened_with(&self, from: *const u8) {
+        let len = self.len as usize;
+        // SAFETY: the caller's; the CPU's side holds the copy's bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(from, self.start as usize as *mut u8, len);
+            std::ptr::copy_nonoverlapping(from, self.data, len);
+        }
+        self.note_landing(0, len);
+    }
+
     /// The offset of a title address in the copy, if it lies in it.
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
@@ -3205,6 +3295,9 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            owned: AtomicU8::new(0),
+            owner_asked: Default::default(),
+            readers: Default::default(),
         }
     }
 
@@ -3657,6 +3750,9 @@ impl Shadow {
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        let Some(_reading) = self.reading() else {
+            return false;
+        };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -3701,6 +3797,9 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        let Some(_reading) = self.reading() else {
+            return false;
+        };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -3943,8 +4042,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        // In place: the card reads title memory itself.
-        if self.place.is_some() {
+        // In place: the card reads title memory itself. The card's alone:
+        // the title wrote nothing there (its pages are kept from the CPU).
+        if self.place.is_some() || self.card_owned() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -3984,7 +4084,7 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
-        if self.place.is_some() {
+        if self.place.is_some() || self.card_owned() {
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4020,6 +4120,9 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        let Some(_reading) = self.reading() else {
+            return 0;
+        };
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
@@ -4248,6 +4351,9 @@ impl Shadow {
     /// 4 KiB that title memory and the CPU's side have alike are left as they
     /// are, and nothing of them is sent ([`land_echo`]).
     fn take_landed(&self, from: usize, to: usize) -> usize {
+        let Some(_reading) = self.reading() else {
+            return 0;
+        };
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -4308,6 +4414,10 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
+        // The card's alone: title memory holds nothing newer, and is not read.
+        let Some(_reading) = self.reading() else {
+            return 0;
+        };
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -4357,6 +4467,10 @@ impl Shadow {
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        // The card's alone: title memory holds nothing newer, and is not read.
+        let Some(_reading) = self.reading() else {
+            return 0;
+        };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).

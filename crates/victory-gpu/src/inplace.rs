@@ -384,6 +384,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // Copies there that are the card's alone are brought down first.
+    crate::host::owner::opening(at, len);
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {

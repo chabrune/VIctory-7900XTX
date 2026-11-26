@@ -3669,6 +3669,7 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     crate::port::log(frames);
     crate::inplace::blocks_line();
+    owner::line();
     #[cfg(feature = "diagnostics")]
     crate::shadow::overlaps_line();
     crate::picked::log(frames);
@@ -3708,6 +3709,7 @@ mod panel;
 mod place;
 pub(crate) mod rec;
 mod send;
+pub(crate) mod owner;
 mod sender;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -4274,6 +4276,16 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
+        // A copy shaders are declared to write for the first time may become
+        // the card's alone (`owner`): before what changed is gathered, so
+        // that what the taking brings up goes with this submission.
+        if owner::on() {
+            for (shadow, _) in declared {
+                if shadow.owner_unasked() {
+                    owner::claim(self, shadow);
+                }
+            }
+        }
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
         let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
@@ -4469,7 +4481,8 @@ impl Host {
             Some(kib) => kib << 10,
         });
         let no_back = no_back_from == 0;
-        for (shadow, ranges) in declared.iter().filter(|(shadow, _)| shadow.span().1 < no_back_from) {
+        // (Nor for a copy that is the card's alone: `owner`.)
+        for (shadow, ranges) in declared.iter().filter(|(shadow, _)| shadow.span().1 < no_back_from && !shadow.card_owned()) {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4498,7 +4511,7 @@ impl Host {
                 }
             }
         }
-        for (shadow, from, len) in looked.iter().filter(|_| !no_back) {
+        for (shadow, from, len) in looked.iter().filter(|l| !no_back && !l.0.card_owned()) {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
