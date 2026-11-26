@@ -9612,6 +9612,17 @@ impl Meter {
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                     objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
                 );
+                {
+                    static BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let rested = crate::pipeline::RESTED.load(Ordering::Relaxed);
+                    let since = rested - BEFORE.swap(rested, Ordering::Relaxed);
+                    if since != 0 {
+                        tracing::info!(
+                            "draws and dispatches left out per frame because their pipeline rested (VICTORY_TRACE_EVERY, VICTORY_PIPELINE_EVERY): {:.1}",
+                            since as f64 / frames
+                        );
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);

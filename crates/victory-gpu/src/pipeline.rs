@@ -174,6 +174,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// Whether it tests rays against the nodes of ray-tracing structures
+    /// ([`traces`]): one of the title's trace programs.
+    pub(crate) traces: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -254,6 +257,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let traces = programs.iter().any(traces);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -272,6 +276,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         tables,
         stores,
         stores_by_address,
+        traces,
         picks: Default::default(),
     })
 }
@@ -447,6 +452,14 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program tests rays against the nodes of ray-tracing
+/// structures (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`): the
+/// title's trace programs do, and no other.
+#[cfg(windows)]
+fn traces(program: &victory_shader::NativeProgram) -> bool {
+    victory_shader::gfx10::decode(&program.code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.ends_with("_intersect_ray"))))
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -462,8 +475,107 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// In which frames it runs ([`rests`]): every `.0`th, those that leave
+    /// `.1` (for one of the trace programs, `.2`: its turn among them, and
+    /// `.0` is theirs); looked up at its first use.
+    every: OnceLock<(u32, u32, bool)>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+/// `VICTORY_PIPELINE_EVERY=<shader hash>:<n>[:<phase>],..`: the pipelines
+/// with a shader of that hash, and the frames they run in.
+fn every_list() -> &'static [(String, u32, u32)] {
+    static LIST: OnceLock<Vec<(String, u32, u32)>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let value = std::env::var("VICTORY_PIPELINE_EVERY").unwrap_or_default();
+        let list: Vec<(String, u32, u32)> = value
+            .split(',')
+            .filter_map(|entry| {
+                let mut parts = entry.trim().split(':');
+                let hash = parts.next().filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))?.to_ascii_lowercase();
+                let n = parts.next()?.trim().parse::<u32>().ok().filter(|n| (2..=16).contains(n))?;
+                let phase = parts.next().and_then(|p| p.trim().parse::<u32>().ok()).unwrap_or(0) % n;
+                Some((hash, n, phase))
+            })
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(?list, "pipelines that run in some frames only (VICTORY_PIPELINE_EVERY)");
+        }
+        list
+    })
+}
+
+/// `VICTORY_TRACE_EVERY=<n>` (2 to 16): the title's trace programs (those
+/// that test rays against ray-tracing structures) each run in one frame of
+/// `n`, by turns: the first one drawn with in the first, the next in the
+/// second, and so on. 1 when not given: they run in every frame.
+fn trace_every() -> u32 {
+    static N: OnceLock<[u32; 2]> = OnceLock::new();
+    let read = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (2..=16).contains(n));
+    let n = N.get_or_init(|| {
+        let n = read("VICTORY_TRACE_EVERY").unwrap_or(1);
+        [n, read("VICTORY_TRACE_EVERY_ALT").unwrap_or(n)]
+    });
+    // Diagnostics: another number by turns, to measure two in one run
+    // (`VICTORY_TRACE_EVERY_ALT=<n>` with `VICTORY_AB=<s>,VICTORY_TRACE_ALT`).
+    #[cfg(feature = "diagnostics")]
+    if n[0] > 1 && crate::ab::pick("VICTORY_TRACE_ALT") == Some(true) {
+        return n[1];
+    }
+    n[0]
+}
+
+/// Draws and dispatches left out since the start because their pipeline
+/// rested in the frame ([`rests`]).
+pub(crate) static RESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the pipeline `this` rests in this frame. One named in
+/// `VICTORY_PIPELINE_EVERY=<shader hash>:<n>[:<phase>],..` runs only in the
+/// frames whose number leaves `phase` (0 unless given) when divided by `n`
+/// (2 to 16), and so do the title's trace programs with
+/// `VICTORY_TRACE_EVERY=<n>` ([`trace_every`]); in the other frames its draws
+/// and dispatches are left out, and what they wrote the last time stands.
+/// For passes whose result the title blends over frames anyway (its traced
+/// light): a part of their cost for a result that follows a few frames
+/// late. `VICTORY_PIPELINE_RESTS=0`: those named all run;
+/// `VICTORY_TRACE_RESTS=0`: the trace programs not named do (both can be
+/// switched by turns with `VICTORY_AB`).
+pub(crate) fn rests(this: This) -> bool {
+    let list = every_list();
+    static NONE: OnceLock<bool> = OnceLock::new();
+    if *NONE.get_or_init(|| list.is_empty() && trace_every() == 1) || this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    let (n, phase, trace) = *p.every.get_or_init(|| {
+        if let Some(named) = p.shaders.iter().find_map(|s| list.iter().find(|e| e.0 == s.hash)) {
+            return (named.1, named.2, false);
+        }
+        #[cfg(windows)]
+        if trace_every() > 1 && p.shaders.iter().any(|s| s.translated().is_some_and(|t| t.traces)) {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let (n, turn) = (trace_every(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            tracing::info!(
+                shaders = ?p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>(),
+                every = n,
+                phase = turn % n,
+                "a trace program runs in some frames only (VICTORY_TRACE_EVERY)"
+            );
+            return (n, turn, true);
+        }
+        (1, 0, false)
+    });
+    // (A trace program's turn is kept, not its phase: the number may change
+    // while the title runs, in a measuring run.)
+    let (n, phase) = if trace { (trace_every(), phase % trace_every().max(1)) } else { (n, phase) };
+    let rests = n > 1
+        && crate::frame::current() % u64::from(n) != u64::from(phase)
+        && if trace { crate::toggled!("VICTORY_TRACE_RESTS") } else { crate::toggled!("VICTORY_PIPELINE_RESTS") };
+    if rests {
+        RESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    rests
+}
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
@@ -631,6 +743,7 @@ fn hand_out(
         builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
+        every: OnceLock::new(),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }

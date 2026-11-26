@@ -1439,6 +1439,10 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
+        // (A pipeline that runs in some frames only: `VICTORY_PIPELINE_EVERY`.)
+        if crate::pipeline::rests(self.pipeline as This) {
+            return false;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -2962,6 +2966,9 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        if crate::pipeline::rests(self.pipeline as This) {
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4129,6 +4136,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
+        if crate::pipeline::rests(self.pipeline as This) {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
