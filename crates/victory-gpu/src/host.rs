@@ -1355,6 +1355,39 @@ fn lazy_prelude() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a list's prelude is a list from a pool, recorded on the list's
+/// own allocator (`VICTORY_PRELUDE_POOL=1`; off by default: an allocator and
+/// a list of its own for each host list that needs a prelude, as before).
+///
+/// A prelude is recorded when its list is submitted. The list is closed by
+/// then, so its allocator is free to record another, and what the prelude
+/// records there lives as long as the list's own commands: until the list is
+/// next reset, after its last submission finished. A command list may be
+/// recorded again as soon as its execution was asked of the queue, so the
+/// prelude's goes back to the pool once the submission's lists are sent
+/// ([`give_preludes`]). Nearly every host list came to have a prelude: 1,358
+/// second allocators and lists beside 1,343 in run rt-trace3, for a few
+/// barriers each. On that driver (an RX 7700 XT; `listmem`'s measurement) an
+/// allocator is 15 KiB of the process's private memory when made and
+/// 1,093 KiB more from the first list recorded on it, a list made closed
+/// 80 KiB, and a recording on an allocator that was used before nothing:
+/// 1.6 GB for those preludes, none of which comes back when they go.
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_some_and(|v| v == "1"))
+}
+
+/// Closed lists for preludes that no submission holds ([`prelude_pool`]).
+static PRELUDES: Mutex<Vec<ID3D12GraphicsCommandList>> = Mutex::new(Vec::new());
+
+/// The preludes of a submission whose lists were sent: their lists may be
+/// recorded again.
+fn give_preludes(used: Vec<ID3D12GraphicsCommandList>) {
+    if !used.is_empty() {
+        PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).extend(used);
+    }
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -3902,6 +3935,8 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+#[cfg(test)]
+mod listmem;
 pub(crate) mod rec;
 mod send;
 pub(crate) mod owner;
@@ -4247,6 +4282,30 @@ impl Host {
             add(C::HostListNs, started.elapsed().as_nanos() as u64);
         }
         list
+    }
+
+    /// A closed list for a prelude that is recorded on its list's allocator
+    /// ([`prelude_pool`]): one no submission holds, or a new one.
+    fn pooled_prelude(&self) -> Option<ID3D12GraphicsCommandList> {
+        if let Some(list) = PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Some(list);
+        }
+        // SAFETY: plain object creation (a list made closed, with no
+        // allocator).
+        let made: windows::core::Result<ID3D12GraphicsCommandList> = unsafe {
+            self.device
+                .cast::<ID3D12Device4>()
+                .and_then(|device| device.CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE))
+        };
+        LISTS[1].fetch_add(1, Ordering::Relaxed);
+        match made {
+            Ok(list) => Some(list),
+            Err(e) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| tracing::warn!(error = %e, "no closed list for a prelude: each list has its own, as before"));
+                None
+            }
+        }
     }
 
     /// An allocator and a closed list for a prelude.
@@ -5897,6 +5956,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // The preludes' lists that came from the pool ([`prelude_pool`]),
+        // given back once `lists` are sent.
+        let mut preludes: Vec<ID3D12GraphicsCommandList> = Vec::new();
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         // Diagnostics: where each list of `lists` starts and what it is, for
@@ -5970,7 +6032,7 @@ impl Host {
         for (_run, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&mut preludes) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
@@ -6099,6 +6161,7 @@ impl Host {
                 sent_here = Some(execute(lists, cuts));
             }
             let signalled = sent_there.or(sent_here).unwrap_or(Ok(()));
+            give_preludes(preludes);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -6208,6 +6271,7 @@ impl Host {
             let _ = (_i, started);
         }
         let _ = &firsts;
+        give_preludes(preludes);
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -7018,7 +7082,11 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    ///
+    /// `used`: takes the prelude's list if it came from the pool
+    /// ([`prelude_pool`]), for the caller to give back when the submission's
+    /// lists are sent.
+    fn prelude(&self, used: &mut Vec<ID3D12GraphicsCommandList>) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7082,17 +7150,24 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
-            fail(format_args!("no host list for a state prelude"));
+        // From the pool, on this list's allocator: the list is closed (it
+        // is being submitted), and what is recorded there stays until the
+        // list's next reset, after its last submission finished.
+        let pooled = if prelude_pool() { host().and_then(|h| h.pooled_prelude()) } else { None };
+        let (allocator, list, own) = match &pooled {
+            Some(list) => (&self.allocator, list, false),
+            None => {
+                let Some((allocator, list)) = self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref() else {
+                    fail(format_args!("no host list for a state prelude"));
+                };
+                (allocator, list, true)
+            }
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // SAFETY: a prelude of its own is not executing (every submission is
+        // waited for), and its allocator holds nothing else; the textures are
+        // live.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
+            (if own { allocator.Reset() } else { Ok(()) }).and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
@@ -7109,7 +7184,9 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        let prelude = list.cast().ok();
+        used.extend(pooled);
+        prelude
     }
 
     /// Notes what the command about to be recorded does, as a marker
