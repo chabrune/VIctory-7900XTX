@@ -316,14 +316,26 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// command runs without its two such waits; its state changes stay), both
 /// bits for `both`. For timing only: without the waits a shader may read
 /// what another has not finished writing.
+///
+/// By turns in one run, each on its own: `VICTORY_AB=<s>,VICTORY_BARRIER_TEST_GROUPS,
+/// VICTORY_BARRIER_TEST_INDIRECT` (and `VICTORY_BARRIER_TEST_PLACED`, the full
+/// waits around the title's buffer copies done at their place,
+/// `crate::host::place`), for the card's time by phase.
 pub(crate) fn barrier_test() -> u8 {
     static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
+    let mut test = *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
         Ok("groups") => 1,
         Ok("indirect") => 2,
         Ok("both") => 3,
         _ => 0,
-    })
+    });
+    if crate::ab::pick("VICTORY_BARRIER_TEST_GROUPS") == Some(true) {
+        test |= 1;
+    }
+    if crate::ab::pick("VICTORY_BARRIER_TEST_INDIRECT") == Some(true) {
+        test |= 2;
+    }
+    test
 }
 
 /// Per range compared after a submission (start, length): times, and the

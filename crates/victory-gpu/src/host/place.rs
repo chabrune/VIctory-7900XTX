@@ -169,6 +169,13 @@ pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] = [const { std::syn
 /// # Safety
 /// An open list.
 unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
+    // Diagnostics, for timing only (`crate::copystat::barrier_test`): left out
+    // in its phases of `VICTORY_AB`, a copy may run beside what it should
+    // follow.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_BARRIER_TEST_PLACED") == Some(true) {
+        return;
+    }
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     let enhanced = *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
