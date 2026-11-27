@@ -3995,6 +3995,8 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 #[cfg(test)]
+mod hwrt;
+#[cfg(test)]
 mod listmem;
 pub(crate) mod rec;
 mod send;
