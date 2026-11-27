@@ -97,6 +97,13 @@ It keeps the choices in
 `%LOCALAPPDATA%\victory-7900xtx\start.json` (outside the repository) and
 `scripts\start.ps1 -Last` starts again with them.
 
+**`Lancer VIctory.cmd`** (double-click it, at the root of the repository) opens
+the same choices as a window (`scripts\lanceur.ps1`, in French): a preset on
+top (the fastest measured with ray tracing by default: the Series S profile,
+ray tracing low, render scale 0.5, the release build), each setting below it
+with what it costs, the performance overlay, a button that starts the game and
+one that puts a shortcut on the desktop.
+
 For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
 `amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in

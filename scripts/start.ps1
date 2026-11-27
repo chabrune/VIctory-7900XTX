@@ -2,6 +2,8 @@
 # avec scripts\play.ps1 (qui pose les réglages de fond du profil).
 #   scripts\start.ps1          le menu
 #   scripts\start.ps1 -Last    relance directement avec les derniers choix
+# (La fenêtre de scripts\lanceur.ps1, ouverte par « Lancer VIctory.cmd », enregistre les mêmes
+# choix et lance par ici.)
 # Les choix sont gardés hors du dépôt, dans %LOCALAPPDATA%\victory-7900xtx\start.json
 # (le chemin de votre copie du jeu n'y entre jamais dans git).
 param([switch]$Last)
@@ -20,13 +22,14 @@ $s = [ordered]@{
     Output     = 'jeu'
     Anisotropy = '16'
     Upscaler   = '6'
-    RenderScale = 'jeu'
+    RenderScale = '0.5'
     Sharpness  = '0.5'
     TextureStore = '0'
     Ambient    = '0.8'
-    RayTracing = '0'
+    RayTracing = 'bas'
+    Hud        = '0'
     Safe       = '0'
-    Build      = 'diag'
+    Build      = 'release'
     Extra      = ''
 }
 if (Test-Path $store) {
@@ -67,6 +70,7 @@ $menu = @(
     @{ K = 'TextureStore'; N = 'Magasin de textures sur disque'; V = @('0', '1'); H = '1 : les textures déjà vues s''affichent tout de suite en pleine définition la fois suivante ; prend environ 2 Go de mémoire vive en plus (à éviter avec 32 Go) et de la place sur le disque (1,5 Go pour trois minutes de jeu, dans %LOCALAPPDATA%\victory-7900xtx\texture-store, à effacer pour repartir de zéro)' }
     @{ K = 'Ambient'; N = 'Lumière ambiante estimée'; V = @(); H = '0 : sortie du jeu telle quelle ; 0.8 conseillé (intérieurs moins noirs sans ray tracing)' }
     @{ K = 'RayTracing'; N = 'Ray tracing du jeu'; V = @('0', 'bas', '1'); H = '0 : sans (lumière ambiante estimée à la place) ; bas : éclairage indirect par rayons calculé une image sur trois à six, 33 img/s dans la première scène jouée et 28-31 dans la cinématique d''ouverture sur RX 7700 XT (conseillé) ; 1 : calculé à chaque image, 16-18 img/s' }
+    @{ K = 'Hud'; N = 'Affichage des performances'; V = @('0', '1'); H = '1 : un panneau en surimpression (images par seconde, temps d''image, mémoire carte) ; 0 : rien' }
     @{ K = 'Safe'; N = 'Mode sûr'; V = @('0', '1'); H = '1 : sans les chemins rapides récents, à essayer d''abord si quelque chose ne va pas' }
     @{ K = 'Build'; N = 'Version du programme'; V = @('diag', 'release'); H = 'diag : celle de toutes les mesures (avec diagnostics) ; release : sans diagnostics' }
     @{ K = 'Extra'; N = 'Réglages libres'; V = @(); H = 'NOM=valeur séparés par des virgules, par ex. VICTORY_PANEL=1 ; vide : aucun' }
@@ -142,6 +146,7 @@ $more = @{
 if ([double]::Parse($s.Sharpness, [Globalization.CultureInfo]::InvariantCulture) -gt 0) { $more.VICTORY_FSR_SHARPNESS = $s.Sharpness } else { $more.VICTORY_FSR_SHARPNESS = '0' }
 if ($s.Clock -eq '60') { $more.VICTORY_FRAME_INTERVAL_MS = '16.667' }
 if ($s.Output -ne 'jeu') { $more.VICTORY_OUTPUT = $s.Output }
+if ($s.Hud -eq '1') { $more.VICTORY_PANEL = '1' }
 $more.VICTORY_UPSCALER = $s.Upscaler
 foreach ($pair in ($s.Extra -split ',')) {
     $name, $value = $pair.Trim() -split '=', 2
