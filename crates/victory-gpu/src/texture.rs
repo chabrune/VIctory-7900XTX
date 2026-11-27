@@ -1623,6 +1623,11 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
     let Some(copy) = crate::resource::made_copy(resource) else {
         return false;
     };
+    if crate::resource::mapped_mips_enabled()
+        && copy.grown.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
     let Some((from, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
         return false;
     };
@@ -1835,6 +1840,15 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
+    // A coarse view can trigger promotion for a retained finer request.
+    // Use the new base for both staging reuse and the actual upload.
+    let first = if crate::resource::mapped_mips_enabled()
+        && copy.grown.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        copy.base
+    } else {
+        first
+    };
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
@@ -1864,16 +1878,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let d = unsafe { texture.GetDesc() };
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
-    // A coarse view can trigger promotion for a finer view whose request
-    // was retained. Fill the new base on that upload so finish_refresh
-    // can publish the promoted resource to all its existing views.
-    let first = if crate::resource::mapped_mips_enabled()
-        && copy.grown.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        level0
-    } else {
-        crate::resource::read_from(&layout, first).max(level0).min(mips - 1)
-    };
+    let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
     let read = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         mips - first
