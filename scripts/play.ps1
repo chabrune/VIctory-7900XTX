@@ -199,6 +199,11 @@ if ($Console -eq 'series-s') {
     # 29.8, 30.0 and 30.2 (run c1); the card stands idle 2.3 ms a frame against 3.0. No error in
     # four runs, the picture the same. -More @{VICTORY_SUBMIT_AFTER='0'}: as before.
     $settings.VICTORY_SUBMIT_AFTER = '1'
+    # The title's menus are black on this profile and its start screen waits for Enter (A).
+    # The harness presses it for us, in every build (crates/victory-hle/src/modules/
+    # gameinput.rs, `scripted`): one press every four seconds from 6 to 62 s, a single press
+    # (holding A is what skips the opening cutscene). -More @{VICTORY_KEYS=...}: your own.
+    $settings.VICTORY_KEYS = '6:Enter,10:Enter,14:Enter,18:Enter,22:Enter,26:Enter,30:Enter,34:Enter,38:Enter,42:Enter,46:Enter,50:Enter,54:Enter,58:Enter,62:Enter'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
