@@ -144,6 +144,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::ray_queries() {
             bytes.extend_from_slice(b"VICTORY_RT_QUERY=1 (2)");
         }
+        // One answer for the whole scene at a top level's root: its own
+        // branch, kept apart from the roots' queries above.
+        if victory_shader::emit::rt_scene_query() {
+            bytes.extend_from_slice(b"VICTORY_RT_SCENE_QUERY=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

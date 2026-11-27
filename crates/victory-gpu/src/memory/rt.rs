@@ -128,6 +128,13 @@ pub(super) struct Rt {
     frame: u64,
     asked: usize,
     built: u32,
+    /// Bottom structures built in the frame, and since the start; whole
+    /// scenes built the same way; the frames the path saw.
+    builds_now: u32,
+    builds_all: u64,
+    scenes_now: u32,
+    scenes_all: u64,
+    frames: u64,
     /// Since the start: triangles in the host's structures, bytes of them,
     /// structures turned down, entries whose place another root had.
     stats: [u64; 4],
@@ -225,6 +232,9 @@ impl Memory {
             self.rt.frame = self.frame;
             self.rt.asked = 0;
             self.rt.built = 0;
+            self.rt.builds_now = 0;
+            self.rt.scenes_now = 0;
+            self.rt.frames += 1;
             self.rt_settle();
         }
         // The views of the structures made since this heap was last here.
@@ -280,6 +290,8 @@ impl Memory {
             match self.rt_build(list, address, triangles, first, root) {
                 Some(known) => {
                     self.rt.built += triangles;
+                    self.rt.builds_now += 1;
+                    self.rt.builds_all += 1;
                     self.rt.known.insert(address, known);
                 }
                 None => {
@@ -325,8 +337,18 @@ impl Memory {
         if frame >= self.rt.said + 600 {
             self.rt.said = frame;
             let there = self.rt.known.values().filter(|k| matches!(k, Known::There { .. })).count();
+            let (mut tops, mut held, mut with) = (0usize, 0usize, 0usize);
+            for scene in &self.rt.scenes {
+                tops += 1;
+                held += scene.instances.len();
+                with += scene
+                    .instances
+                    .iter()
+                    .filter(|(bottom, _)| matches!(self.rt.known.get(bottom), Some(Known::There { .. })))
+                    .count();
+            }
             tracing::info!(
-                "the card's own ray tracing (VICTORY_RT_QUERY=1): {} structures of the host's, {} triangles, {} MB; {} roots in the table, {} title structures known, {} turned down, {} roots without a place in the table, {} scenes there",
+                "the card's own ray tracing (VICTORY_RT_QUERY=1): {} structures of the host's, {} triangles, {} MB; {} roots in the table, {} title structures known, {} turned down, {} roots without a place in the table, {} scenes there, {} top levels of the title's, {} instances, {} of them with one of our structures",
                 self.rt.structures.len(),
                 self.rt.stats[0],
                 self.rt.stats[1] >> 20,
@@ -334,7 +356,21 @@ impl Memory {
                 self.rt.known.len(),
                 self.rt.stats[2],
                 self.rt.stats[3],
-                self.rt.scenes.iter().filter(|s| s.there).count()
+                self.rt.scenes.iter().filter(|s| s.there).count(),
+                tops,
+                held,
+                with
+            );
+            tracing::info!(
+                "the card's own ray tracing, a frame's builds: {} headers asked, {} bottom structures built, {} whole scenes built; since the start {} frames, {} bottom structures and {} whole scenes ({} and {} a frame)",
+                self.rt.asked,
+                self.rt.builds_now,
+                self.rt.scenes_now,
+                self.rt.frames,
+                self.rt.builds_all,
+                self.rt.scenes_all,
+                self.rt.builds_all / self.rt.frames.max(1),
+                self.rt.scenes_all / self.rt.frames.max(1)
             );
         }
     }
@@ -426,7 +462,7 @@ impl Memory {
                 bytes.len(),
                 false,
             );
-            let instances = bytes
+            let instances: Vec<(u64, [f32; 12])> = bytes
                 .chunks_exact(128)
                 .map(|d| {
                     let mut matrix = [0f32; 12];
@@ -441,6 +477,16 @@ impl Memory {
             // says its answer is an instance of the whole scene.
             let node = (address + ((u64::from(root) >> 3) << 6)) >> 6;
             let key = [node as u32, (node >> 32) as u32 | RT_ROOT_THERE | RT_ROOT_SCENE];
+            tracing::info!(
+                "a top level of the title's (VICTORY_RT_SCENE=1): header at {:#x}, {} instances at byte {}, root {:#x}, key {:#x}; the first one's structure {:#x} and matrix {:?}",
+                address,
+                count,
+                elements,
+                root,
+                key[0],
+                instances[0].0,
+                instances[0].1
+            );
             self.rt.looked.insert(address);
             self.rt.scenes.push(Scene {
                 key,
@@ -468,6 +514,12 @@ impl Memory {
                 })
                 .collect();
             if built.is_empty() || built == self.rt.scenes[at].built || self.rt.scenes[at].frame == self.frame {
+                continue;
+            }
+            // (The reading on its own builds nothing: `VICTORY_RT_SCENE=1`
+            // says what the title's top levels hold, the host's structure
+            // over a scene waits for `VICTORY_RT_SCENE_QUERY=1`.)
+            if !victory_shader::emit::rt_scene_query() {
                 continue;
             }
             self.rt_scene_build(list, heap, base, at, built);
@@ -533,7 +585,8 @@ impl Memory {
             NumDescs: built.len() as u32,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                InstanceDescs: instances.GetGPUVirtualAddress(),
+                // SAFETY: the upload buffer, alive.
+                InstanceDescs: unsafe { instances.GetGPUVirtualAddress() },
             },
         };
         let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
@@ -582,6 +635,8 @@ impl Memory {
         let sent = Arc::new(AtomicBool::new(false));
         let told = sent.clone();
         list.defer_host(move || told.store(true, Ordering::Relaxed));
+        self.rt.scenes_now += 1;
+        self.rt.scenes_all += 1;
         let scene = &mut self.rt.scenes[at];
         scene.built = built;
         scene.frame = self.frame;

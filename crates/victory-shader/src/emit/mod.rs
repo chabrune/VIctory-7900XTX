@@ -121,7 +121,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, RT_FIRST_SLOT, RT_ROOT_THERE, RT_ROOTS, RT_ROOTS_AT, RT_STRUCTURES, rt_root_entry, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, RT_FIRST_SLOT, RT_ROOT_SCENE, RT_ROOT_THERE, RT_ROOTS, RT_ROOTS_AT, RT_STRUCTURES, rt_root_entry, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -212,15 +212,27 @@ pub fn ray_queries() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RT_QUERY").is_some_and(|v| v == "1"))
 }
 
-/// Whether the host builds one structure over all the instances of the
-/// title's top-level structures (`VICTORY_RT_SCENE=1`, off by default), so a
-/// trace program that comes to one of their roots is answered with the
-/// nearest instance of the whole scene, one query for the ray rather than
-/// the walk of the top level's box nodes (`shader::RT_ROOT_SCENE`). Only
-/// where [`ray_queries`] is on: the translator's side of it is the same.
+/// Whether the host reads the title's top-level structures
+/// (`VICTORY_RT_SCENE=1`, off by default): their instances, and which of them
+/// have a structure of the host's, told in the log. A reading only, no
+/// structure of the card's over the scene ([`rt_scene_query`]); only where
+/// [`ray_queries`] is on: the translator's side of it is the same.
 pub fn rt_scene() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| ray_queries() && std::env::var_os("VICTORY_RT_SCENE").is_some_and(|v| v == "1"))
+}
+
+/// Whether the host also builds one structure over all the instances of the
+/// title's top-level structures (`VICTORY_RT_SCENE_QUERY=1`, off by default),
+/// so a trace program that comes to one of their roots is answered with the
+/// nearest instance of the whole scene, one query for the ray rather than
+/// the walk of the top level's box nodes (`shader::RT_ROOT_SCENE`). Only
+/// where [`rt_scene`] is on. (Kept apart: a first run with the scene read
+/// only, then this one to see whether the card takes the instance data as
+/// the host reads it.)
+pub fn rt_scene_query() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rt_scene() && std::env::var_os("VICTORY_RT_SCENE_QUERY").is_some_and(|v| v == "1"))
 }
 
 /// The clean-up passes that run over a translated program before it is

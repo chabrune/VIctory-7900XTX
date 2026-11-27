@@ -396,8 +396,14 @@ impl<'a> Lower<'a> {
         let root = self.s.m.bin(c, Bin::And, same, same_top);
         // A root the host has one structure over the instances of: the
         // answer is the instance of the nearest hit.
-        let scene = self.s.m.bin(c, Bin::And, words[1], scene_bit);
-        let scene = self.s.m.cmp(c, pred::NE, scene, zero);
+        // (Only where the host's structure over a scene may answer at all:
+        // programs that no scene is put in front of are the ones they were.)
+        let scene = if crate::emit::rt_scene_query() {
+            let marked = self.s.m.bin(c, Bin::And, words[1], scene_bit);
+            Some(self.s.m.cmp(c, pred::NE, marked, zero))
+        } else {
+            None
+        };
         // The node's own test first, root or not: a ray that enters none of
         // a root's boxes misses the structure, and the card is not asked
         // (a ray crosses the boxes of many instances it does not touch; a
@@ -459,13 +465,18 @@ impl<'a> Lower<'a> {
         let triangle = self.s.m.bin(asked, Bin::Shl, node, k3);
         // A whole scene: the nearest instance, at 128 bytes a node, as the
         // pointer the root's box test would have returned (kind 6).
-        let instance = self.s.op(asked, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 207, &[query]);
-        let (two, kind6) = (k(self, 2), k(self, 6));
-        let at = self.s.m.bin(asked, Bin::Mul, instance, two);
-        let node = self.s.m.bin(asked, Bin::Add, words[3], at);
-        let answer = self.s.m.bin(asked, Bin::Shl, node, k3);
-        let answer = self.s.m.bin(asked, Bin::Or, answer, kind6);
-        let answer = self.s.m.select(asked, scene, answer, triangle);
+        let answer = match scene {
+            Some(scene) => {
+                let instance = self.s.op(asked, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 207, &[query]);
+                let (two, kind6) = (k(self, 2), k(self, 6));
+                let at = self.s.m.bin(asked, Bin::Mul, instance, two);
+                let node = self.s.m.bin(asked, Bin::Add, words[3], at);
+                let answer = self.s.m.bin(asked, Bin::Shl, node, k3);
+                let answer = self.s.m.bin(asked, Bin::Or, answer, kind6);
+                self.s.m.select(asked, scene, answer, triangle)
+            }
+            None => triangle,
+        };
         let found = self.s.m.select(asked, hit, answer, miss);
         self.s.m.terminate(asked, Term::Br(join));
         self.cur = join;
