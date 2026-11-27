@@ -175,6 +175,14 @@ if ($Console -eq 'series-s') {
     # waits for. So it pays only where the card alone sets the frame (the dormitory that
     # follows: 39-43 ms of the card against 41-47), for a softer picture: off unless asked.
     $settings.VICTORY_UPSCALER = '6'
+    # With AMD's PC upscaler at hand (amd_fidelityfx_upscaler_dx12.dll in the folder
+    # VICTORY_FIDELITYFX_DIR or victory.toml's fidelityfx_dir names, or in
+    # %LOCALAPPDATA%\victory-7900xtx\fidelityfx), the title keeps FidelityFX (7) and its calls
+    # are served by that PC build (VICTORY_FSR_PC=1, apps/victory/src/run.rs): FSR 4.1.2 on an
+    # RX 7700 XT, a far cleaner picture than either of the above (the user's verdict,
+    # 2026-11-27), for about 3 ms a frame more (33.3-33.6 ms against 30.5 in the first played
+    # scene). -More @{VICTORY_UPSCALER='6'}: the title's own, as before.
+    $settings.VICTORY_UPSCALER = '7'
     if ($RenderScale) { $settings.VICTORY_RENDER_SCALE = $RenderScale.ToString([Globalization.CultureInfo]::InvariantCulture) }
     # A list's prelude (the states of its textures, and since the merge of Belobug/VIctory-
     # Belobug-AMD 5d6bd84 the uploads of the title's textures) is a list from a pool on the
@@ -213,6 +221,23 @@ if ($Console -eq 'series-s') {
     $settings.VICTORY_KEYS = '6:Enter,10:Enter,14:Enter,18:Enter,22:Enter,26:Enter,30:Enter,34:Enter,38:Enter,42:Enter,46:Enter,50:Enter,54:Enter,58:Enter,62:Enter'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+if ($Console -eq 'series-s' -and $settings.VICTORY_UPSCALER -eq '7' -and -not $settings.ContainsKey('VICTORY_FSR_PC')) {
+    # FidelityFX is only worth having with the PC build of it: without, the title's own.
+    $folders = @($env:VICTORY_FIDELITYFX_DIR, (Join-Path $env:LOCALAPPDATA 'victory-7900xtx\fidelityfx'))
+    $toml = if ($env:VICTORY_CONFIG) { $env:VICTORY_CONFIG } else { Join-Path $PSScriptRoot '..\victory.toml' }
+    if (Test-Path $toml) {
+        $line = Select-String -Path $toml -Pattern "^\s*fidelityfx_dir\s*=\s*['""](.+)['""]" | Select-Object -First 1
+        if ($line) { $folders += $line.Matches[0].Groups[1].Value }
+    }
+    $found = $folders | Where-Object { $_ -and (Test-Path (Join-Path $_ 'amd_fidelityfx_upscaler_dx12.dll')) } | Select-Object -First 1
+    if ($found) {
+        $settings.VICTORY_FSR_PC = '1'
+        if (-not $env:VICTORY_FIDELITYFX_DIR) { $settings.VICTORY_FIDELITYFX_DIR = $found }
+    } else {
+        Write-Host "AMD's PC upscaler (amd_fidelityfx_upscaler_dx12.dll) is not installed: the title's own upscaler is used."
+        $settings.VICTORY_UPSCALER = '6'
+    }
+}
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }

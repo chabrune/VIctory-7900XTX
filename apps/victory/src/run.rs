@@ -87,6 +87,21 @@ pub fn run(
         let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
         victory_loader::load(&prepared, &cache)?
     } else {
+        // `VICTORY_FSR_PC=1` with a folder of AMD's PC upscaler: the title's
+        // own FidelityFX calls (what it upscales with on Series S when its
+        // upscaler is 7, `VICTORY_UPSCALER=7`) are served by the PC build on
+        // the host's card, with no change to the title: its console FSR
+        // pipelines cannot be read here, and what it falls back to is a
+        // dotted picture. Off unless asked.
+        if std::env::var_os("VICTORY_FSR_PC").is_some_and(|v| v == "1") {
+            let dir = cfg
+                .fidelityfx_dir
+                .as_deref()
+                .context("VICTORY_FSR_PC=1 requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.")?;
+            victory_hle::modules::fidelityfx::use_host_dir(dir)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
+        }
         victory_loader::load(&prepared, &images)?
     };
     // The program is mapped from the copy `load` wrote: the file's bytes

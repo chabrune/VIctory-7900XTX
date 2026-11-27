@@ -24,7 +24,7 @@ $s = [ordered]@{
     FpsLimit   = '0'
     Output     = 'jeu'
     Anisotropy = '16'
-    Upscaler   = '6'
+    Upscaler   = '7'
     RenderScale = 'jeu'
     Sharpness  = '0.5'
     TextureStore = '0'
@@ -67,7 +67,7 @@ $menu = @(
     @{ K = 'FpsLimit'; N = 'Limite d''images par seconde'; V = @(); H = '0 : aucune ; sinon un nombre (par ex. 30 pour une cadence régulière)' }
     @{ K = 'Output'; N = 'Résolution de sortie du jeu'; V = @('jeu', '1280x720', '1664x936', '1920x1080', '2560x1440', '3840x2160'); H = 'jeu : celle du profil (1080p en series-s, 4K en series-x). Autres tailles : expérimental, en series-s le jeu s''arrête au démarrage en 2560x1440' }
     @{ K = 'Anisotropy'; N = 'Filtrage anisotrope'; V = @('0', '2', '4', '8', '16'); H = '0 : ce que le jeu demande ; 16 : sols et murs plus nets de biais, sans coût mesuré' }
-    @{ K = 'Upscaler'; N = 'Mise à l''échelle de l''image'; V = @('6', '7'); H = '6 : celle du jeu, image lisse (conseillé) ; 7 : FidelityFX, ici en mode de secours : image en pointillés' }
+    @{ K = 'Upscaler'; N = 'Mise à l''échelle de l''image'; V = @('6', '7'); H = '7 : FidelityFX par la version PC d''AMD (FSR), image la plus propre, environ 3 ms de plus par image (conseillé ; sans la DLL d''AMD, celle du jeu est prise à la place) ; 6 : celle du jeu, image lisse' }
     @{ K = 'RenderScale'; N = 'Échelle de rendu (series-s)'; V = @('jeu', '0.6', '0.55', '0.5'); H = 'jeu : 2/3 de la sortie (1280x720 pour 1080p) ; 0.5 : 960x540, image plus douce, la carte travaille 3 ms de moins par image (24,9 ms contre 28,2 sur RX 7700 XT). Ne rapporte des images que dans les scènes où la carte seule limite ; series-s et mise à l''échelle du jeu (6) uniquement' }
     @{ K = 'Sharpness'; N = 'Netteté (avec FidelityFX, la 7)'; V = @(); H = 'de 0 (aucune) à 1 ; 0.5 conseillé ; sans effet avec la mise à l''échelle du jeu' }
     @{ K = 'TextureStore'; N = 'Magasin de textures sur disque'; V = @('0', '1'); H = '1 : les textures déjà vues s''affichent tout de suite en pleine définition la fois suivante ; prend environ 2 Go de mémoire vive en plus (à éviter avec 32 Go) et de la place sur le disque (1,5 Go pour trois minutes de jeu, dans %LOCALAPPDATA%\victory-7900xtx\texture-store, à effacer pour repartir de zéro)' }

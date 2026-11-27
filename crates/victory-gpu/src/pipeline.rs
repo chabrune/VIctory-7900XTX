@@ -708,7 +708,11 @@ pub(crate) fn rests(this: This) -> bool {
             return (named.1, named.2, false);
         }
         #[cfg(windows)]
-        if trace_every() > 1 && p.shaders.iter().any(|s| s.translated().is_some_and(|t| t.traces)) {
+        // (Or a program `VICTORY_TRACE_TURNS` names without its being one:
+        // what only prepares a trace program's rays rests with it.)
+        if trace_every() > 1
+            && (p.shaders.iter().any(|s| trace_turns().iter().any(|t| t.0 == s.hash)) || p.shaders.iter().any(|s| s.translated().is_some_and(|t| t.traces)))
+        {
             // (Those without a turn of their own: behind the ones given.)
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let turns = trace_turns();

@@ -20,7 +20,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 # porté à 1080p par le jeu, cadence libre, version sans diagnostics.
 $s = [ordered]@{
     Exe = ''; Console = 'series-s'; Clock = '60'; Window = 'windowed'; Monitor = '0'; VSync = '0'
-    FpsLimit = '0'; Output = 'jeu'; Anisotropy = '16'; Upscaler = '6'; RenderScale = 'jeu'
+    FpsLimit = '0'; Output = 'jeu'; Anisotropy = '16'; Upscaler = '7'; RenderScale = 'jeu'
     Sharpness = '0.5'; TextureStore = '0'; Ambient = '0.8'; RayTracing = 'bas'; Hud = '0'
     Safe = '0'; Build = 'release'; Extra = ''
 }
