@@ -20,7 +20,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 # porté à 1080p par le jeu, cadence libre, version sans diagnostics.
 $s = [ordered]@{
     Exe = ''; Console = 'series-s'; Clock = '60'; Window = 'windowed'; Monitor = '0'; VSync = '0'
-    FpsLimit = '0'; Output = 'jeu'; Anisotropy = '16'; Upscaler = '6'; RenderScale = '0.5'
+    FpsLimit = '0'; Output = 'jeu'; Anisotropy = '16'; Upscaler = '6'; RenderScale = 'jeu'
     Sharpness = '0.5'; TextureStore = '0'; Ambient = '0.8'; RayTracing = 'bas'; Hud = '0'
     Safe = '0'; Build = 'release'; Extra = ''
 }
@@ -46,10 +46,10 @@ if (-not $s.Exe) {
 
 # Les préréglages : ce qu'ils posent, et ce qui a été mesuré avec (première scène jouée).
 $presets = [ordered]@{
-    'Performance (conseillé)' = @{ Set = @{ Console = 'series-s'; RayTracing = 'bas'; RenderScale = '0.5'; Clock = '60' }
-        Note = 'Ray tracing bas, rendu 960x540 porté à 1080p. Le meilleur débit mesuré avec ray tracing : 32-35 img/s en jeu, la carte travaille 3 ms de moins par image que ci-dessous ; image un peu plus douce.' }
-    'Équilibré' = @{ Set = @{ Console = 'series-s'; RayTracing = 'bas'; RenderScale = 'jeu'; Clock = '60' }
+    'Équilibré (conseillé)' = @{ Set = @{ Console = 'series-s'; RayTracing = 'bas'; RenderScale = 'jeu'; Clock = '60' }
         Note = 'Ray tracing bas, rendu 1280x720 porté à 1080p : 30-34 img/s en jeu, image plus nette.' }
+    'Performance (image plus douce)' = @{ Set = @{ Console = 'series-s'; RayTracing = 'bas'; RenderScale = '0.5'; Clock = '60' }
+        Note = 'Ray tracing bas, rendu 960x540 porté à 1080p. Le meilleur débit mesuré avec ray tracing : 32-35 img/s en jeu, la carte travaille 3 ms de moins par image que ci-dessous ; image un peu plus douce.' }
     'Sans ray tracing (le plus rapide)' = @{ Set = @{ Console = 'series-s'; RayTracing = '0'; RenderScale = 'jeu'; Clock = '60' }
         Note = 'Lumière ambiante estimée à la place des rayons : 35-36 img/s dans la cinématique d''ouverture, intérieurs moins justes.' }
     'Ray tracing complet' = @{ Set = @{ Console = 'series-s'; RayTracing = '1'; RenderScale = 'jeu'; Clock = '60' }
