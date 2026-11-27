@@ -31,7 +31,15 @@ impl Source<'_> {
 
     pub(crate) fn label(&self) -> String {
         match self {
-            Source::Raw { offset, .. } => format!("@{offset:#x}"),
+            Source::Raw { offset, data } => {
+                // A container kept as is names itself (its `PSV0`, usually);
+                // a record's header says the name for the packed form.
+                let name = Container::parse(data).ok().and_then(|c| c.program_name());
+                match name {
+                    Some(name) => format!("@{offset:#x} {name}"),
+                    None => format!("@{offset:#x}"),
+                }
+            }
             Source::Packed(r) => format!("@{:#x} {}", r.offset, r.name.unwrap_or("?")),
         }
     }

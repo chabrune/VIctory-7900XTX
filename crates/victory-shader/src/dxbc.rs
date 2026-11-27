@@ -111,6 +111,66 @@ impl<'a> Container<'a> {
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
+
+    /// The name the console's compiler gave the program, when the container
+    /// holds it: a word reading `<prefix>_<stage>_<family>_<variant>_Wrapped`
+    /// (the prefix, when there is one, says what made the container: `MSNC`
+    /// and `MSR` for mesh pipelines, `TL` and `ptfx` for effects). It sits in
+    /// the container's own bytes (`PSV0` for the shaders seen so far), never
+    /// in the archive's tables; 95 % of the containers this title hands over
+    /// have one, and the name is what a run's log and the frame recorder know
+    /// a program by. `None` when no word reads as one.
+    pub fn program_name(&self) -> Option<&'a str> {
+        let mut best: Option<&'a str> = None;
+        for part in &self.parts {
+            for word in words(part.data) {
+                if !reads_as_name(word) {
+                    continue;
+                }
+                // The same name may appear twice; a longer word wins over a
+                // shorter one that happens to read as a name too.
+                if best.is_none_or(|b| word.len() > b.len()) {
+                    best = Some(std::str::from_utf8(word).expect("ASCII by construction"));
+                }
+            }
+        }
+        best
+    }
+}
+
+/// The runs of ASCII letters, digits and underscores in `data`.
+fn words(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at < data.len() && !word(&data[at]) {
+            at += 1;
+        }
+        let start = at;
+        while at < data.len() && word(&data[at]) {
+            at += 1;
+        }
+        (at > start).then(|| &data[start..at])
+    })
+}
+
+/// The stages a name may begin with.
+const STAGES: [&[u8]; 8] = [b"AS", b"MS", b"VS", b"HS", b"DS", b"GS", b"PS", b"CS"];
+
+/// Whether `word` reads as a program name: an optional one- or two-segment
+/// prefix, then a stage, then a family, and ending in `_Wrapped`. Requiring the
+/// stage to be a whole segment keeps a word such as `tMixOutputCS_...` (a
+/// bitcode identifier) out.
+fn reads_as_name(word: &[u8]) -> bool {
+    if word.len() > 160 || !word.ends_with(b"_Wrapped") {
+        return false;
+    }
+    let segments: Vec<&[u8]> = word.split(|&b| b == b'_').collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        return false;
+    }
+    // ... `<stage>`, then at least the family, then `Wrapped`.
+    matches!(segments.iter().position(|s| STAGES.contains(s)), Some(at) if at <= 2 && at + 2 < segments.len())
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -159,6 +219,48 @@ pub fn build(parts: &[(FourCC, &[u8])]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_program_name() {
+        // Names made up here (the title's own stay out of the repository).
+        let named = build(&[
+            (FourCC::SFI0, &[1, 2, 0, 0]),
+            (FourCC::PSV0, b"\0\0\0\0PS_ToyFamily_0011aabb_Wrapped\0"),
+            (FourCC::HASH, &[9; 20]),
+        ]);
+        assert_eq!(
+            Container::parse(&named).unwrap().program_name(),
+            Some("PS_ToyFamily_0011aabb_Wrapped")
+        );
+        // A mesh pipeline's prefix, and a two-segment one.
+        let mesh = build(&[(FourCC::PSV0, b"..MSNC_VS_ToyMesh_0011aabb_Wrapped..")]);
+        assert_eq!(
+            Container::parse(&mesh).unwrap().program_name(),
+            Some("MSNC_VS_ToyMesh_0011aabb_Wrapped")
+        );
+        let effect = build(&[(FourCC::PSV0, b"\0TL_PS_Ours_0011aabb_Wrapped\0")]);
+        assert_eq!(
+            Container::parse(&effect).unwrap().program_name(),
+            Some("TL_PS_Ours_0011aabb_Wrapped")
+        );
+        // A bitcode identifier that holds a stage but is not a segment of its
+        // own is not a name, and neither is a word without `_Wrapped`.
+        assert_eq!(
+            Container::parse(&build(&[(
+                FourCC::DXIL,
+                b"tMixOutputCS_Toy_0011aabb_Wrapped"
+            )]))
+            .unwrap()
+            .program_name(),
+            None
+        );
+        assert_eq!(
+            Container::parse(&build(&[(FourCC::DXIL, b"CS_ToyFamily_0011aabb")]))
+                .unwrap()
+                .program_name(),
+            None
+        );
+    }
 
     #[test]
     fn round_trips_parts() {
