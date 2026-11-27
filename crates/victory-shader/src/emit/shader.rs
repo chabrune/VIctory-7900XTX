@@ -87,6 +87,14 @@ pub const RT_ROOTS: u32 = 1 << 14;
 pub const RT_ROOTS_AT: u32 = MEMORY_PAGES * 8;
 /// See [`RT_ROOTS`].
 pub const RT_ROOT_THERE: u32 = 1 << 31;
+/// See [`RT_ROOTS`]: the root of a whole top-level structure, whose
+/// instances the host has one structure over (`VICTORY_RT_SCENE=1`). The
+/// card is asked once for the ray's nearest hit among them all, and the
+/// answer is the title's own instance node (kind 6) of that hit, at
+/// `(first + 2 instance) << 3 | 6` where `first` is the entry's fourth
+/// dword: the program descends into that instance as it would have after
+/// the root's box test.
+pub const RT_ROOT_SCENE: u32 = 1 << 30;
 /// See [`RT_ROOTS`]: past the slots of the memory copies' views.
 pub const RT_FIRST_SLOT: u32 = 1 << 12;
 /// The host's structures that can be numbered.

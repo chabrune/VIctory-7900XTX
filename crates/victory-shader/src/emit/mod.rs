@@ -212,6 +212,17 @@ pub fn ray_queries() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RT_QUERY").is_some_and(|v| v == "1"))
 }
 
+/// Whether the host builds one structure over all the instances of the
+/// title's top-level structures (`VICTORY_RT_SCENE=1`, off by default), so a
+/// trace program that comes to one of their roots is answered with the
+/// nearest instance of the whole scene, one query for the ray rather than
+/// the walk of the top level's box nodes (`shader::RT_ROOT_SCENE`). Only
+/// where [`ray_queries`] is on: the translator's side of it is the same.
+pub fn rt_scene() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ray_queries() && std::env::var_os("VICTORY_RT_SCENE").is_some_and(|v| v == "1"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a

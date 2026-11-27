@@ -359,7 +359,7 @@ impl<'a> Lower<'a> {
     /// Starts in the current block and leaves `self.cur` at the block it
     /// ends in.
     fn bvh_root(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool, low: V, high: V) -> [V; 4] {
-        use crate::emit::shader::{RT_FIRST_SLOT, RT_ROOT_THERE, RT_ROOTS, RT_ROOTS_AT, SLOT_MEMORY, USER_MEMORY_BASE};
+        use crate::emit::shader::{RT_FIRST_SLOT, RT_ROOT_SCENE, RT_ROOT_THERE, RT_ROOTS, RT_ROOTS_AT, SLOT_MEMORY, USER_MEMORY_BASE};
         use crate::native::RootType;
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -370,9 +370,11 @@ impl<'a> Lower<'a> {
         let key = self.s.m.bin(c, Bin::LShr, low, k6);
         let above = self.s.m.bin(c, Bin::Shl, high, k26);
         let key = self.s.m.bin(c, Bin::Or, key, above);
-        let top = self.s.m.bin(c, Bin::LShr, high, k6);
-        let there = k(self, RT_ROOT_THERE);
-        let top = self.s.m.bin(c, Bin::Or, top, there);
+        let seen = self.s.m.bin(c, Bin::LShr, high, k6);
+        // (The entry's second dword is those bits above with the marks that
+        // say which kind of root it is: [`RT_ROOT_THERE`], [`RT_ROOT_SCENE`].)
+        let (scene_bit, zero) = (k(self, RT_ROOT_SCENE), k(self, 0));
+        let plain = k(self, !(RT_ROOT_SCENE | RT_ROOT_THERE));
         // Its entry in the table behind the directory.
         let (golden, shift, k4, first) = (k(self, 0x9E37_79B1), k(self, 32 - RT_ROOTS.trailing_zeros()), k(self, 4), k(self, RT_ROOTS_AT));
         let entry = self.s.m.bin(c, Bin::Mul, key, golden);
@@ -389,8 +391,13 @@ impl<'a> Lower<'a> {
             })
             .collect();
         let same = self.s.m.cmp(c, pred::EQ, words[0], key);
-        let same_top = self.s.m.cmp(c, pred::EQ, words[1], top);
+        let marked = self.s.m.bin(c, Bin::And, words[1], plain);
+        let same_top = self.s.m.cmp(c, pred::EQ, marked, seen);
         let root = self.s.m.bin(c, Bin::And, same, same_top);
+        // A root the host has one structure over the instances of: the
+        // answer is the instance of the nearest hit.
+        let scene = self.s.m.bin(c, Bin::And, words[1], scene_bit);
+        let scene = self.s.m.cmp(c, pred::NE, scene, zero);
         // The node's own test first, root or not: a ray that enters none of
         // a root's boxes misses the structure, and the card is not asked
         // (a ray crosses the boxes of many instances it does not touch; a
@@ -449,8 +456,17 @@ impl<'a> Lower<'a> {
         let hit = self.s.m.cmp(asked, pred::EQ, status, one);
         // The triangle's node, as a pointer of kind 0.
         let node = self.s.m.bin(asked, Bin::Add, words[3], primitive);
-        let pointer = self.s.m.bin(asked, Bin::Shl, node, k3);
-        let found = self.s.m.select(asked, hit, pointer, miss);
+        let triangle = self.s.m.bin(asked, Bin::Shl, node, k3);
+        // A whole scene: the nearest instance, at 128 bytes a node, as the
+        // pointer the root's box test would have returned (kind 6).
+        let instance = self.s.op(asked, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 207, &[query]);
+        let (two, kind6) = (k(self, 2), k(self, 6));
+        let at = self.s.m.bin(asked, Bin::Mul, instance, two);
+        let node = self.s.m.bin(asked, Bin::Add, words[3], at);
+        let answer = self.s.m.bin(asked, Bin::Shl, node, k3);
+        let answer = self.s.m.bin(asked, Bin::Or, answer, kind6);
+        let answer = self.s.m.select(asked, scene, answer, triangle);
+        let found = self.s.m.select(asked, hit, answer, miss);
         self.s.m.terminate(asked, Term::Br(join));
         self.cur = join;
         std::array::from_fn(|n| {

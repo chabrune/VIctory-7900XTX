@@ -826,3 +826,53 @@ off, and it is one more pass for the card. Its 83a5593 is here already
 flushed) is more work for the card in an instruction every shader has: behind a switch
 and measured, or not at all. Marvisak 7ac1f54 (the seed of the ordered section's
 collision id) meets another form of that code here.
+
+## The card's ray tracing in play, and the step after it (2026-11-27, 11:00)
+
+**Pushed.** `main` is at `c0f885ca` and went to `origin/main` today
+(`20570425..c0f885ca`, ten commits: the host's side of the card's ray
+tracing, the translator's side of it, its first runs in the title, the
+Series S profile's upscaler through AMD's PC FidelityFX). Nothing is left
+uncommitted in the main worktree; `rt-hardware` (`.claude/worktrees/help`)
+is at `1b5f79e0` and clean.
+
+**What the card's ray tracing does in the title** (`VICTORY_RT_QUERY=1`, off
+by default): some 900 structures of the host's over the static bottom
+levels of the first played scene, 600,000 triangles, no device loss in the
+runs of the day, the room lit as without it. The clean measurement on a
+fixed scene gives **no gain**: about 51 ms a frame with it and without. So
+it stays off. The per-program table (the trace programs' 20.4 ms, all but a
+tenth of a millisecond of it traversal) is in
+`docs/hardware-ray-tracing.md`.
+
+**`1b5f79e0` is not compiled and not run.** It grows the roots' table from
+16,384 to 131,072 entries (in 16,384, 136 of 1,041 roots found their place
+taken) and adds the line that says what the host did every 150 frames. It
+was written while the machine was in a run: compile it before merging, and
+drop it if it does not compile.
+
+**First lead to check**: the host's structure builds carrying on every
+frame. A structure whose header is read again and again is built again, and
+each build is a copy of its leaves and a bottom level of the card's; the
+line `the card's own ray tracing` says how many structures there are, which
+does not tell it apart. The count to add before the next run is the builds
+and the copied bytes per frame (a structure that is already `There` must not
+come back to `Asked`); if it is not zero once the world has settled, that is
+the first thing to mend, before any measurement of the query is worth
+anything.
+
+**The step after the roots** — one query per ray for the whole scene,
+dynamic objects included — is written, behind `VICTORY_RT_SCENE=1` (off by
+default, needs `VICTORY_RT_QUERY=1`), and **not compiled and not run**: the
+host takes a top-level structure's instances and builds one structure of the
+card's over every instance it has a bottom level for, and a trace program
+that comes to that top level's root is answered with the nearest instance of
+the scene (the title's own instance node), one query instead of the walk of
+the top level's box nodes. `docs/hardware-ray-tracing.md` says what is
+assumed of the title's instance format, and that the dynamic objects whose
+structures the host does not build are still walked as before, so the
+scene's structure covers only what the host had built by then. What it
+should be worth, if the assumptions hold: the top level's box walk (1,590
+instances in the first played scene, up to 15 boxes deep) for one query, and
+with it the roots' queries of the instances the ray would never have
+reached.

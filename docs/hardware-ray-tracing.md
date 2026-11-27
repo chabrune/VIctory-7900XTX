@@ -122,6 +122,38 @@ that test first, the programs with long rays got slower: 3592426e3e9142d8
 structures that are not unpacked static ones (a tenth of the triangles) are
 walked as before.
 
+## The whole scene in one query (`VICTORY_RT_SCENE=1`, written 2026-11-27)
+
+Beyond the roots of bottom levels, the step that would carry the real gain:
+one query for the ray at a **top level**, over every instance of the scene.
+The host reads a packed structure's 64-byte header when it comes, takes it
+for a top level when it is version 6, not a bottom level and not packed
+(`marks & 0x8100 == 0`), reads its instances (128 bytes each: three rows of
+four floats, the bottom level's address in dword 15 in 256-byte units) and
+builds **one structure of the host's over the instances it has one of ours
+for**, with the title's matrices and the title's instance number as the
+card's `InstanceID`.
+
+A trace program that comes to the top level's root now reads an entry of
+the roots' table marked [`shader::RT_ROOT_SCENE`] and asks the card once;
+the answer is the title's own instance node (kind 6) of the nearest hit,
+`(first + 2 instance) << 3 | 6`, so the program descends into that instance
+and transforms its ray as it always did. The entry counts only once the
+build was submitted and two frames have passed, and its view is in the heap
+before then. The structure is built again when the set of instances the
+host has a structure for changes (at most once a frame, while the static
+structures stream in over the world's first seconds).
+
+What is assumed and not measured: that a title instance is 128 bytes at the
+top level's elements offset (dword 13), that its three rows of four floats
+are DXR's own `Transform` rows, that its 128-byte node's pointer is
+`(elements/64 + 2 i) << 3 | 6`, and that a top level's header keeps no 0x100
+mark once unpacked. Written behind `VICTORY_RT_SCENE=1` (off by default,
+needs `VICTORY_RT_QUERY=1`), **not compiled and not run** as of 2026-11-27
+(the machine was in a run); the structures that are not the host's (dynamic
+ones) are still walked as before, so the scene's structure covers what the
+host had built by then.
+
 ## The host's side (`crates/victory-gpu/src/memory/rt.rs`)
 
 - Which structures: the bottom levels a top-level build names in upload

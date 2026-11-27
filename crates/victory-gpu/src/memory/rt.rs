@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use victory_shader::emit::{RT_FIRST_SLOT, RT_ROOT_THERE, RT_ROOTS, RT_ROOTS_AT, RT_STRUCTURES, rt_root_entry};
+use victory_shader::emit::{RT_FIRST_SLOT, RT_ROOT_SCENE, RT_ROOT_THERE, RT_ROOTS, RT_ROOTS_AT, RT_STRUCTURES, rt_root_entry};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Interface;
@@ -54,6 +54,11 @@ const MOST: u32 = 1 << 20;
 const SETTLE: u64 = 2;
 /// Frames before a header that was not ready is asked for again.
 const AGAIN: u64 = 30;
+/// The most instances of a top-level structure the host takes (128 bytes
+/// each).
+const INSTANCES: u32 = 1 << 15;
+/// Headers of packed structures read for a top level in a frame, at most.
+const LOOKS: usize = 8;
 
 /// Where a title structure stands.
 enum Known {
@@ -70,6 +75,30 @@ enum Known {
     There { entry: u32, number: u32 },
 }
 
+/// A top-level structure of the title's whose instances the host has one
+/// structure over (`VICTORY_RT_SCENE=1`): a trace program that comes to its
+/// root is answered with the nearest instance of the whole scene, one query
+/// for the ray instead of the walk of the top level's box nodes.
+struct Scene {
+    /// The root's key, as the roots' table has it.
+    key: [u32; 2],
+    /// The number (64-byte units from the title structure's start) of its
+    /// first instance.
+    first: u32,
+    /// Its instances, in the title's order: the bottom level's address and
+    /// its three rows of four floats.
+    instances: Vec<(u64, [f32; 12])>,
+    /// The instance indices the host's structure has, and their numbers.
+    built: Vec<(u32, u32)>,
+    /// The host's structure number (its view), once made.
+    number: Option<u32>,
+    /// The frame it was built in, and whether that build was submitted.
+    frame: u64,
+    sent: Option<Arc<AtomicBool>>,
+    /// Its entry in the roots' table, once written.
+    there: bool,
+}
+
 #[derive(Default)]
 pub(super) struct Rt {
     known: HashMap<u64, Known>,
@@ -79,8 +108,15 @@ pub(super) struct Rt {
     /// The shared indices (32-bit, three a triangle).
     indices: Option<ID3D12Resource>,
     /// The host's structures by number: the top level a view shows, and the
-    /// bottom level it holds.
-    structures: Vec<(ID3D12Resource, ID3D12Resource)>,
+    /// bottom level it holds (none for one over a whole scene's instances).
+    structures: Vec<(ID3D12Resource, Option<ID3D12Resource>)>,
+    /// The title's top-level structures taken, and the host's structure over
+    /// the instances of each (`VICTORY_RT_SCENE=1`).
+    scenes: Vec<Scene>,
+    /// The packed structures whose header was read for a top level.
+    looked: std::collections::HashSet<u64>,
+    /// Where the sweep for top levels is in `packed_order`.
+    sweep: usize,
     /// The numbers of the structures made, in the order they were made (a
     /// number is used again when its title structure went), and per view
     /// heap how far down that list its views are written.
@@ -284,19 +320,21 @@ impl Memory {
             }
             self.rt.known.insert(address, Known::Asked { frame, at });
         }
+        self.rt_scenes(list, heap, base);
         list.keep(&headers);
         if frame >= self.rt.said + 600 {
             self.rt.said = frame;
             let there = self.rt.known.values().filter(|k| matches!(k, Known::There { .. })).count();
             tracing::info!(
-                "the card's own ray tracing (VICTORY_RT_QUERY=1): {} structures of the host's, {} triangles, {} MB; {} roots in the table, {} title structures known, {} turned down, {} roots without a place in the table",
+                "the card's own ray tracing (VICTORY_RT_QUERY=1): {} structures of the host's, {} triangles, {} MB; {} roots in the table, {} title structures known, {} turned down, {} roots without a place in the table, {} scenes there",
                 self.rt.structures.len(),
                 self.rt.stats[0],
                 self.rt.stats[1] >> 20,
                 there,
                 self.rt.known.len(),
                 self.rt.stats[2],
-                self.rt.stats[3]
+                self.rt.stats[3],
+                self.rt.scenes.iter().filter(|s| s.there).count()
             );
         }
     }
@@ -334,6 +372,220 @@ impl Memory {
             }
             self.rt.known.insert(address, Known::There { entry, number });
         }
+    }
+
+    /// At `list`, once: the title's top-level structures whose header came,
+    /// and the host's structure over the instances of each
+    /// (`VICTORY_RT_SCENE=1`).
+    fn rt_scenes(&mut self, list: &HostList, heap: &HostHeap, base: u32) {
+        if !victory_shader::emit::rt_scene() {
+            return;
+        }
+        // A few headers a frame, in the order the structures came: one that
+        // is still packed comes back on the next lap, once unpacked.
+        let len = self.packed_order.len();
+        if len == 0 {
+            return;
+        }
+        let mut at = self.rt.sweep % len;
+        for _ in 0..LOOKS.min(len) {
+            at = (at + 1) % len;
+            let address = self.packed_order[at];
+            if self.rt.looked.contains(&address) {
+                continue;
+            }
+            let mut header = [0u8; 64];
+            // SAFETY: title memory, whose pages a packed structure's are.
+            crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 64, false);
+            let h: Vec<u32> = header
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .collect();
+            let (version, marks) = (h[0] & 0xFFFF, h[0] >> 16);
+            // (A bottom level, or one still packed: one still packed is
+            // looked at again, its header is not unpacked yet.)
+            if version != 6 || marks & 0x8100 != 0 {
+                // (A bottom level whatever its state is never a top level;
+                // a packed one that is not comes back unpacked.)
+                if marks & 0x8000 != 0 || marks & 0x100 == 0 {
+                    self.rt.looked.insert(address);
+                }
+                continue;
+            }
+            let (count, root, elements) = (h[3], h[12], h[13]);
+            if count == 0 || count > INSTANCES || !elements.is_multiple_of(64) {
+                self.rt.looked.insert(address);
+                continue;
+            }
+            let mut bytes = vec![0u8; count as usize * 128];
+            // SAFETY: as above: the instances follow the header, in title
+            // memory.
+            crate::host::copy_mapped(
+                bytes.as_mut_ptr(),
+                (address + u64::from(elements)) as *const u8,
+                bytes.len(),
+                false,
+            );
+            let instances = bytes
+                .chunks_exact(128)
+                .map(|d| {
+                    let mut matrix = [0f32; 12];
+                    for (k, m) in matrix.iter_mut().enumerate() {
+                        *m = f32::from_le_bytes(d[4 * k..4 * k + 4].try_into().unwrap());
+                    }
+                    let bottom = u64::from(u32::from_le_bytes(d[60..64].try_into().unwrap())) << 8;
+                    (bottom, matrix)
+                })
+                .collect();
+            // The root's key, as the roots' table has it, and the mark that
+            // says its answer is an instance of the whole scene.
+            let node = (address + ((u64::from(root) >> 3) << 6)) >> 6;
+            let key = [node as u32, (node >> 32) as u32 | RT_ROOT_THERE | RT_ROOT_SCENE];
+            self.rt.looked.insert(address);
+            self.rt.scenes.push(Scene {
+                key,
+                first: elements / 64,
+                instances,
+                built: Vec::new(),
+                number: None,
+                frame: 0,
+                sent: None,
+                there: false,
+            });
+        }
+        self.rt.sweep = at;
+        // The host's structure over the instances that have one of ours,
+        // whenever that set changed (once a frame: it covers what is there
+        // by then).
+        for at in 0..self.rt.scenes.len() {
+            let built: Vec<(u32, u32)> = self.rt.scenes[at]
+                .instances
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (bottom, _))| match self.rt.known.get(bottom) {
+                    Some(Known::There { number, .. }) => Some((i as u32, *number)),
+                    _ => None,
+                })
+                .collect();
+            if built.is_empty() || built == self.rt.scenes[at].built || self.rt.scenes[at].frame == self.frame {
+                continue;
+            }
+            self.rt_scene_build(list, heap, base, at, built);
+        }
+        // The entries of those whose build is in.
+        let frame = self.frame;
+        let ready: Vec<usize> = self
+            .rt
+            .scenes
+            .iter()
+            .enumerate()
+            .filter_map(|(at, scene)| {
+                let sent = scene.sent.as_ref()?;
+                (!scene.there && sent.load(Ordering::Relaxed) && scene.frame + SETTLE <= frame).then_some(at)
+            })
+            .collect();
+        for at in ready {
+            let (key, first) = (self.rt.scenes[at].key, self.rt.scenes[at].first);
+            let Some(number) = self.rt.scenes[at].number else { continue };
+            let entry = rt_root_entry(key[0]);
+            let pointer = self.rt_entry(entry);
+            // SAFETY: an entry of the table, under the mutex.
+            if unsafe { pointer.add(1).read_volatile() } != 0 {
+                continue;
+            }
+            // SAFETY: as above. The key's second dword last: the entry
+            // counts from then on.
+            unsafe {
+                pointer.write_volatile(key[0]);
+                pointer.add(2).write_volatile(number);
+                pointer.add(3).write_volatile(first);
+                pointer.add(1).write_volatile(key[1]);
+            }
+            self.rt.scenes[at].there = true;
+        }
+    }
+
+    /// The host's structure over the instances of the scene at `at` that
+    /// have one of ours (`built`: the title's instance indices, then their
+    /// numbers), and its view in `heap`.
+    fn rt_scene_build(&mut self, list: &HostList, heap: &HostHeap, base: u32, at: usize, built: Vec<(u32, u32)>) {
+        let Some(host) = host() else { return };
+        let Ok(device) = host.device.cast::<ID3D12Device5>() else { return };
+        let Ok(list4) = list.list.cast::<ID3D12GraphicsCommandList4>() else { return };
+        let Some((instances, data)) = host.upload_buffer(built.len() as u64 * 64) else { return };
+        // (The instances are the title's own, in its order: the card's
+        // nearest hit names the title's instance by its number.)
+        for (n, &(i, number)) in built.iter().enumerate() {
+            let Some(structure) = self.rt.structures[number as usize].1.clone() else { continue };
+            let matrix = self.rt.scenes[at].instances[i as usize].1;
+            let mut desc = D3D12_RAYTRACING_INSTANCE_DESC::default();
+            desc.Transform.copy_from_slice(&matrix);
+            // (InstanceID: the title's own instance number; 24 bits.)
+            desc._bitfield1 = i & 0xFF_FFFF;
+            // SAFETY: a structure of ours, alive.
+            desc.AccelerationStructure = unsafe { structure.GetGPUVirtualAddress() };
+            // SAFETY: the upload buffer holds `built.len()` descriptions.
+            unsafe { data.cast::<D3D12_RAYTRACING_INSTANCE_DESC>().add(n).write_unaligned(desc) };
+        }
+        let top = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+            NumDescs: built.len() as u32,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                InstanceDescs: instances.GetGPUVirtualAddress(),
+            },
+        };
+        let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        // SAFETY: a query of the device's into `sizes`.
+        unsafe { device.GetRaytracingAccelerationStructurePrebuildInfo(&top, &mut sizes) };
+        if sizes.ResultDataMaxSizeInBytes == 0 {
+            return;
+        }
+        let state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+        let Some(tlas) = card_buffer(sizes.ResultDataMaxSizeInBytes, state) else { return };
+        let Some(scratch) = card_buffer(sizes.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_COMMON) else { return };
+        // SAFETY: an open list, live buffers; what the build reads the list
+        // keeps until it has run.
+        unsafe {
+            list4.BuildRaytracingAccelerationStructure(
+                &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                    DestAccelerationStructureData: tlas.GetGPUVirtualAddress(),
+                    Inputs: top,
+                    SourceAccelerationStructureData: 0,
+                    ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(),
+                },
+                None,
+            );
+            list.list.ResourceBarrier(&[written(&tlas)]);
+        }
+        list.keep(&instances);
+        list.keep(&scratch);
+        let number = match self.rt.scenes[at].number {
+            Some(number) => number,
+            None => {
+                if self.rt.structures.len() as u32 >= RT_STRUCTURES {
+                    return;
+                }
+                let number = self.rt.structures.len() as u32;
+                self.rt.structures.push((tlas.clone(), None));
+                self.rt.made.push(number);
+                self.rt.scenes[at].number = Some(number);
+                number
+            }
+        };
+        self.rt.structures[number as usize] = (tlas.clone(), None);
+        // (Its view in this heap at once: the entry may be read from the
+        // frames after this one on, and no other heap's turn may come
+        // before.)
+        heap.structure_at(base + RT_FIRST_SLOT + number, &tlas);
+        let sent = Arc::new(AtomicBool::new(false));
+        let told = sent.clone();
+        list.defer_host(move || told.store(true, Ordering::Relaxed));
+        let scene = &mut self.rt.scenes[at];
+        scene.built = built;
+        scene.frame = self.frame;
+        scene.sent = Some(sent);
     }
 
     /// Records into `list` the host's structure for the title's bottom level
@@ -469,9 +721,9 @@ impl Memory {
             self.rt.stats[1] += sizes.ResultDataMaxSizeInBytes + top_sizes.ResultDataMaxSizeInBytes;
             if let Some(i) = again {
                 self.rt.free.swap_remove(i);
-                self.rt.structures[number as usize] = (tlas, blas);
+                self.rt.structures[number as usize] = (tlas, Some(blas));
             } else {
-                self.rt.structures.push((tlas, blas));
+                self.rt.structures.push((tlas, Some(blas)));
             }
             self.rt.made.push(number);
         }
