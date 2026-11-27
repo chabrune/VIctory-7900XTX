@@ -14,6 +14,12 @@
 #               VIctory-Belobug-AMD cd8dfc0 and 2a8eed9 (README.md says where its DLL comes from)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 #               Light DRED is requested by default for diag and requires --features diagnostics.
+# -Warm         does not start the title: makes ahead, with this profile's settings, the pipelines
+#               earlier runs drew with (victory warm --used), so that the driver has them before
+#               a run needs one. Once after a change of the translator (a pull that says so) or
+#               of the graphics driver; seconds when the driver's cache has them already (2,748
+#               pipelines in 7 s on 2026-11-27), minutes when it has none. Translated shaders
+#               need nothing: they are kept between builds and made at first use otherwise.
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Console      series-x (the default: 3840x2160) or series-s: the title renders lower and
 #               scales up to 1920x1080 itself; on an RX 7700 XT 17-20 fps in the opening
@@ -30,6 +36,7 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [switch]$Warm,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -202,4 +209,6 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
+try {
+    if ($Warm) { & $victory warm --used } else { & $victory run $Exe --execute --console $Console }
+} finally { Pop-Location }

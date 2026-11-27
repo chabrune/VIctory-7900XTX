@@ -2,11 +2,14 @@
 # avec scripts\play.ps1 (qui pose les réglages de fond du profil).
 #   scripts\start.ps1          le menu
 #   scripts\start.ps1 -Last    relance directement avec les derniers choix
+#   scripts\start.ps1 -Last -Warm   ne lance pas le jeu : prépare, avec ces mêmes choix, les
+#                              pipelines déjà vus (play.ps1 -Warm), une fois après une mise à
+#                              jour du programme ou du pilote graphique
 # (La fenêtre de scripts\lanceur.ps1, ouverte par « Lancer VIctory.cmd », enregistre les mêmes
 # choix et lance par ici.)
 # Les choix sont gardés hors du dépôt, dans %LOCALAPPDATA%\victory-7900xtx\start.json
 # (le chemin de votre copie du jeu n'y entre jamais dans git).
-param([switch]$Last)
+param([switch]$Last, [switch]$Warm)
 
 $store = Join-Path $env:LOCALAPPDATA 'victory-7900xtx\start.json'
 
@@ -160,6 +163,15 @@ if ($s.Safe -eq '1') { $arguments.Safe = $true }
 if ($s.TextureStore -eq '1') { $arguments.TextureStore = $true }
 if ($s.RenderScale -ne 'jeu' -and $s.Console -eq 'series-s' -and $s.Upscaler -eq '6') {
     $arguments.RenderScale = [double]::Parse($s.RenderScale, [Globalization.CultureInfo]::InvariantCulture)
+}
+if ($Warm) {
+    Write-Host ''
+    Write-Host "Préparation (profil $($s.Console), version $($s.Build)) : les pipelines déjà vus sont refaits pour le pilote graphique. Quelques secondes s'il les a déjà, quelques minutes sinon." -ForegroundColor Green
+    $arguments.Warm = $true
+    & (Join-Path $PSScriptRoot 'play.ps1') @arguments
+    Write-Host ''
+    Write-Host 'Préparation terminée : vous pouvez fermer cette fenêtre et lancer le jeu.' -ForegroundColor Green
+    exit 0
 }
 Write-Host ''
 Write-Host "Lancement : profil $($s.Console), cadence $($s.Clock), fenêtre $($s.Window), mise à l'échelle $($s.Upscaler), anisotrope $($s.Anisotropy), ray tracing $($s.RayTracing), magasin de textures $($s.TextureStore)." -ForegroundColor Green

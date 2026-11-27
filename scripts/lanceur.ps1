@@ -174,8 +174,15 @@ $close.Text = 'Fermer'; $close.Location = New-Object System.Drawing.Point(526, $
 $close.Add_Click({ $form.Close() })
 $form.Controls.Add($close)
 $shortcut = New-Object System.Windows.Forms.Button
-$shortcut.Text = 'Raccourci sur le Bureau'; $shortcut.Location = New-Object System.Drawing.Point(16, $y); $shortcut.Size = New-Object System.Drawing.Size(170, 36)
+$shortcut.Text = 'Raccourci Bureau'; $shortcut.Location = New-Object System.Drawing.Point(16, $y); $shortcut.Size = New-Object System.Drawing.Size(116, 36)
 $form.Controls.Add($shortcut)
+$prepare = New-Object System.Windows.Forms.Button
+$prepare.Text = 'Préparer'; $prepare.Location = New-Object System.Drawing.Point(138, $y); $prepare.Size = New-Object System.Drawing.Size(86, 36)
+$form.Controls.Add($prepare)
+$tips = New-Object System.Windows.Forms.ToolTip
+$tips.AutoPopDelay = 20000
+$tips.SetToolTip($prepare, "À faire une fois après une mise à jour du programme ou du pilote graphique :`nprépare les shaders déjà vus, pour que la première partie ne saccade pas.`nQuelques secondes si le pilote les a déjà, quelques minutes sinon. Rien d'autre n'est à faire après une compilation.")
+$tips.SetToolTip($shortcut, 'Met un raccourci « VIctory » vers cette fenêtre sur le Bureau.')
 $form.AcceptButton = $launch
 
 # Ce que la fenêtre montre : les choix enregistrés, et le préréglage qui leur correspond.
@@ -243,6 +250,17 @@ $launch.Add_Click({
     $start = Join-Path $PSScriptRoot 'start.ps1'
     Start-Process powershell.exe -WorkingDirectory $root -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$start`"", '-Last')
     $form.Close()
+})
+$prepare.Add_Click({
+    $status.ForeColor = [System.Drawing.Color]::FromArgb(160, 60, 40)
+    $c = Read-Choices
+    if (-not $c) { return }
+    if (Get-Process victory -ErrorAction SilentlyContinue) { $status.Text = 'Le jeu tourne : fermez-le avant de préparer.'; return }
+    Save-Choices $c
+    $start = Join-Path $PSScriptRoot 'start.ps1'
+    Start-Process powershell.exe -WorkingDirectory $root -ArgumentList @('-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$start`"", '-Last', '-Warm')
+    $status.ForeColor = [System.Drawing.Color]::FromArgb(40, 120, 60)
+    $status.Text = 'Préparation lancée dans une autre fenêtre : attendez « Préparation terminée » avant de lancer le jeu.'
 })
 $shortcut.Add_Click({
     try {
