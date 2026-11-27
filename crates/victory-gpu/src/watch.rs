@@ -4246,6 +4246,48 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
+        // A copy of ours that faults at one address again and again: what
+        // answers "try again" below did not make the page readable (or
+        // writable), and the thread would stand there for good: the
+        // submitting thread and its helpers did, in a refresh of a host
+        // copy, until the title ended itself after 30 s (runs long1 and
+        // long3, 2026-11-27). After 256 times in a row the copy fails
+        // instead, as it does for a page that is not there, and the log
+        // says where.
+        if let Some(exit) = ours
+            && r.NumberParameters >= 2
+        {
+            thread_local! {
+                static SAME: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, 0)) };
+            }
+            let address = r.ExceptionInformation[1];
+            let (last, times) = SAME.get();
+            let times = if last == address { times + 1 } else { 0 };
+            SAME.set((address, times));
+            if times >= 256 {
+                SAME.set((0, 0));
+                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    // SAFETY: a plain query of that address.
+                    let mut m = unsafe { std::mem::zeroed::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>() };
+                    unsafe { windows_sys::Win32::System::Memory::VirtualQuery(address as *const _, &mut m, size_of_val(&m)) };
+                    tracing::error!(
+                        address = format_args!("{address:#x}"),
+                        kind = r.ExceptionInformation[0],
+                        code = format_args!("{:#x}", r.ExceptionCode),
+                        state = format_args!("{:#x}", m.State),
+                        protect = format_args!("{:#x}", m.Protect),
+                        card_block = card_block(address),
+                        views = VIEWS.any(address / BLOCK, address / BLOCK + 1),
+                        quiet = QUIET.any(address / BLOCK, address / BLOCK + 1),
+                        protected = PROTECTED.any(address / BLOCK, address / BLOCK + 1),
+                        owner = %crate::host::owner::says(address),
+                        "a copy of ours faulted 256 times in a row at one address: it fails instead of standing there"
+                    );
+                }
+                return fail(exit);
+            }
+        }
         // A block of the title's general allocator kept from the CPU until
         // something touches it (`crate::inplace::block_fault`): opened, and
         // the access goes on.

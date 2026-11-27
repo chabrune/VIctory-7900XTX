@@ -427,6 +427,22 @@ fn settle(shadow: &Shadow, who: Option<Who>) -> bool {
     }
 }
 
+/// For a log line: what the table says of `at` (the copy there, its state,
+/// its pages).
+pub(crate) fn says(at: usize) -> String {
+    let table = table();
+    match table.range(..=at).next_back() {
+        Some((first, (end, shadow))) => match shadow.upgrade() {
+            Some(shadow) => {
+                let (start, len) = shadow.span();
+                format!("entry {first:#x}..{end:#x} (inside: {}), copy {start:#x}+{len:#x} state {}, count {}", at < *end, shadow.owner().load(Relaxed), COUNT.load(Relaxed))
+            }
+            None => format!("entry {first:#x}..{end:#x} (inside: {}), its copy gone", at < *end),
+        },
+        None => format!("no entry, count {}", COUNT.load(Relaxed)),
+    }
+}
+
 /// A read or write of `at` faulted: if it lies in a copy that is the card's
 /// alone, the copy is brought down and opened (or waited for), and the
 /// access can be tried again. Called from the fault handler.
@@ -452,6 +468,22 @@ pub(crate) fn fault(at: usize, kind: u8, site: usize, ours: bool, stack: usize) 
             Some(Some(shadow)) => {
                 if crate::watch::card_block(at) {
                     return open_block(&shadow, at, Some((site, kind, ours, stack)));
+                }
+                // A copy that is not the card's (only some of its blocks
+                // are, or it was opened meanwhile): the access goes on if
+                // another thread has opened the page by now, and is not
+                // ours to answer if the page is simply not there. Saying
+                // "try again" for a view the title had unmapped under such
+                // a copy stood four threads of ours at one address for
+                // good, and the title ended itself after 30 s (runs long1,
+                // long3 and long4, 2026-11-27: 0x606800000+0x486750, its
+                // memory reserved only).
+                if matches!(shadow.owner().load(Acquire), FREE | OPENED) {
+                    // SAFETY: a plain query of that address.
+                    let mut m = unsafe { std::mem::zeroed::<mem::MEMORY_BASIC_INFORMATION>() };
+                    unsafe { mem::VirtualQuery(at as *const _, &mut m, size_of_val(&m)) };
+                    let there = m.State == mem::MEM_COMMIT && m.Protect & (mem::PAGE_NOACCESS | mem::PAGE_GUARD) == 0 && (kind != 1 || m.Protect & (mem::PAGE_READWRITE | mem::PAGE_WRITECOPY | mem::PAGE_EXECUTE_READWRITE) != 0);
+                    return there;
                 }
                 return settle(&shadow, Some((site, kind, ours, stack)));
             }
