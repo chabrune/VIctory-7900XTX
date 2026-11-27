@@ -2,9 +2,11 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about half the frame rate
-# -RayTracingLow the same light with the title's trace programs run one frame in three to six, by
-#               turns (what they wrote stands in between): 33 frames a second in the first scene
-#               that is played on an RX 7700 XT, 28-31 in the opening cutscene
+# -RayTracingLow the same light; with -More @{VICTORY_TRACE_EVERY='3-6'} the title's trace programs
+#               run one frame in three to six, by turns (what they wrote stands in between): 33
+#               frames a second in the first scene that is played on an RX 7700 XT, 28-31 in the
+#               opening cutscene, but blotches and specks in the traced light. Every frame
+#               since 2026-11-27 (see below)
 # -RenderScale  series-s: the size the title renders at, as a share of the output's width and
 #               height, 0.5 to 0.66 (2/3 without it: 1280x720 for 1920x1080; 0.5: 960x540). A
 #               softer picture for less of the card's work (see below).
@@ -89,7 +91,14 @@ if ($RayTracingLow) {
     # about the same (7.9, 6.8 and 4.4 ms of a timing run's 20.4). These are hashes of the
     # title's shaders in the build measured; another build's are not found and its programs
     # take turns in the order they are first used.
-    $settings.VICTORY_TRACE_EVERY = '3-6'
+    # Since 2026-11-27 they run in every frame all the same: from a save inside the house
+    # (RX 7700 XT, series-s, 65 s runs sv6 and sv7, the same view) the spaced traces left
+    # blotches on the character and white specks on dark surfaces that every frame does
+    # not, at 26 frames a second both ways (the card had the time: its wait went from 0
+    # to 1.5 ms). Not measured outdoors or driving, and the opening's heavy scene pays for
+    # it (50.8 ms a frame at every frame, run hw15).
+    # -More @{VICTORY_TRACE_EVERY='3-6'}: spaced as before.
+    $settings.VICTORY_TRACE_EVERY = '1'
     $settings.VICTORY_TRACE_TURNS = 'f22a76fcb967ee59:0,6d7fe7745ab9c6d8:1,b58eb3ca6ee46427:2,3592426e3e9142d8:2,36f04a4ed0ad1d9b:2'
 }
 if ($TextureStore) {
