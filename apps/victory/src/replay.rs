@@ -47,6 +47,18 @@ pub(crate) struct Replay {
     /// Leave out unordered-access barriers.
     #[arg(long)]
     no_barriers: bool,
+    /// Record the lone unordered-access barriers (what the title's barrier
+    /// groups became) as enhanced global barriers: 1 compute to compute, 2 all
+    /// shading, 3 everything, each unordered access to unordered access; 4
+    /// everything with all caches; 5 compute to all shading, 6 compute to
+    /// compute, 7 all shading, each unordered access to shader resource.
+    #[arg(long, default_value_t = 0)]
+    scope_barriers: u32,
+    /// Leave out the lone unordered-access barriers with no shader work
+    /// before them since their list's last such wait (1), or with no compute
+    /// work (2: draws may stand between).
+    #[arg(long, default_value_t = 0)]
+    idle_barriers: u32,
     /// Join barrier calls with no work between them.
     #[arg(long)]
     merge_barriers: bool,
@@ -279,6 +291,8 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         },
         only_buffers: r.only_buffers,
         no_barriers: r.no_barriers,
+        scope_barriers: r.scope_barriers,
+        idle_barriers: r.idle_barriers,
         merge_barriers: r.merge_barriers,
         skip_clamps: r.skip_clamps,
         batch_clamps: r.batch_clamps,

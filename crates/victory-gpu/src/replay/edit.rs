@@ -53,6 +53,71 @@ pub fn no_uav_barriers(cmds: Vec<Cmd>) -> (Vec<Cmd>, u32) {
     (out, dropped)
 }
 
+/// The flag of an unordered-access barrier [`scoped_uav_barriers`] marked;
+/// its low byte is the kind of enhanced global barrier `play` records for it.
+pub const SCOPED: i32 = 0x4000_0000;
+
+/// Marks the unordered-access barriers that name no resource and stand
+/// alone in their call (what the title's barrier groups become) to be
+/// recorded as an enhanced global barrier of `kind` (`play::scoped`), which
+/// waits for less than everything; how many.
+pub fn scoped_uav_barriers(cmds: Vec<Cmd>, kind: u32) -> (Vec<Cmd>, u32) {
+    let mut marked = 0;
+    let out = cmds
+        .into_iter()
+        .map(|c| match c {
+            Cmd::Barriers { all } if matches!(all[..], [Barrier::Uav { res: NONE, .. }]) => {
+                marked += 1;
+                Cmd::Barriers {
+                    all: vec![Barrier::Uav {
+                        flags: SCOPED | (kind & 0xff) as i32,
+                        res: NONE,
+                    }],
+                }
+            }
+            c => c,
+        })
+        .collect();
+    (out, marked)
+}
+
+/// Drops the lone unordered-access barriers that name no resource and have
+/// no shader work before them since the list's last such wait (`compute`:
+/// no work of a compute pipeline, one of these; draws may stand between);
+/// how many of how many. A list's first is kept: what earlier lists wrote
+/// is not known here.
+pub fn no_idle_uav_barriers(cmds: Vec<Cmd>, compute: Option<&HashSet<u32>>) -> (Vec<Cmd>, u32, u32) {
+    let (mut dropped, mut lone) = (0, 0);
+    let mut dirty = true;
+    let mut bound = NONE;
+    let out = cmds
+        .into_iter()
+        .filter(|c| {
+            match c {
+                Cmd::Pipeline { pso } => bound = *pso,
+                Cmd::Barriers { all } if all.iter().any(|b| matches!(b, Barrier::Uav { .. })) => {
+                    let alone = matches!(all[..], [Barrier::Uav { res: NONE, .. }]);
+                    lone += u32::from(alone);
+                    if alone && !dirty {
+                        dropped += 1;
+                        return false;
+                    }
+                    dirty = false;
+                }
+                c if c.runs_shaders() => {
+                    dirty |= match compute {
+                        Some(compute) => matches!(c, Cmd::Dispatch { .. }) || (matches!(c, Cmd::Indirect { .. }) && compute.contains(&bound)),
+                        None => true,
+                    };
+                }
+                _ => {}
+            }
+            true
+        })
+        .collect();
+    (out, dropped, lone)
+}
+
 /// Barriers only: what a list left out still does to the states of
 /// resources.
 pub fn barriers_only(cmds: Vec<Cmd>) -> Vec<Cmd> {
@@ -659,6 +724,52 @@ mod tests {
         assert_eq!(
             barriers_only(list.clone()),
             vec![list[0].clone(), list[2].clone()]
+        );
+    }
+
+    #[test]
+    fn lone_uav_barriers_are_marked_or_left_out_where_nothing_ran() {
+        let draw = Cmd::Draw { vertices: 3, instances: 1, first: 0, first_instance: 0 };
+        let list = vec![
+            // A list's first is kept: earlier lists' writes are not known.
+            barriers(&[uav(0)]),
+            barriers(&[uav(0)]),
+            go(),
+            barriers(&[uav(0)]),
+            pso(7),
+            draw.clone(),
+            barriers(&[uav(0)]),
+            // Not alone, and one that names a resource: as they are.
+            barriers(&[uav(0), moved(1, 8, 4)]),
+            barriers(&[uav(3)]),
+        ];
+        let (out, dropped, lone) = no_idle_uav_barriers(list.clone(), None);
+        assert_eq!((dropped, lone), (1, 4));
+        let mut want = list.clone();
+        want.remove(1);
+        assert_eq!(out, want);
+        // With the compute pipelines given, a draw is no work that waits.
+        let (out, dropped, lone) = no_idle_uav_barriers(list.clone(), Some(&HashSet::from([9])));
+        assert_eq!((dropped, lone), (2, 4));
+        want.remove(5);
+        assert_eq!(out, want);
+
+        let (out, marked) = scoped_uav_barriers(list.clone(), 6);
+        assert_eq!(marked, 4);
+        let scoped = barriers(&[Barrier::Uav { flags: SCOPED | 6, res: 0 }]);
+        assert_eq!(
+            out,
+            vec![
+                scoped.clone(),
+                scoped.clone(),
+                go(),
+                scoped.clone(),
+                pso(7),
+                draw,
+                scoped,
+                list[7].clone(),
+                list[8].clone()
+            ]
         );
     }
 

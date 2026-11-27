@@ -71,6 +71,13 @@ pub struct Options {
     /// Of those, only the ones all of these match ([`chosen`]).
     pub only_buffers: Vec<String>,
     pub no_barriers: bool,
+    /// The waits the title's barrier groups became, as enhanced global
+    /// barriers of this kind ([`scoped`]); 0: as recorded.
+    pub scope_barriers: u32,
+    /// Leave out the lone unordered-access barriers with no shader work
+    /// before them since the list's last such wait (1), or with no compute
+    /// work (2: draws may stand between); `edit::no_idle_uav_barriers`.
+    pub idle_barriers: u32,
     pub merge_barriers: bool,
     pub skip_clamps: bool,
     /// The clamps in batches (`edit::batch_clamps`); 2: carefully.
@@ -121,6 +128,8 @@ impl Default for Options {
             buffers: Buffers::AsRecorded,
             only_buffers: Vec::new(),
             no_barriers: false,
+            scope_barriers: 0,
+            idle_barriers: 0,
             merge_barriers: false,
             skip_clamps: false,
             batch_clamps: 0,
@@ -146,6 +155,8 @@ impl Default for Options {
 impl Options {
     fn edited(&self) -> bool {
         self.no_barriers
+            || self.scope_barriers > 0
+            || self.idle_barriers > 0
             || self.merge_barriers
             || self.skip_clamps
             || self.batch_clamps > 0
@@ -161,6 +172,8 @@ impl Options {
     fn plain(&self) -> Options {
         Options {
             no_barriers: false,
+            scope_barriers: 0,
+            idle_barriers: 0,
             merge_barriers: false,
             skip_clamps: false,
             batch_clamps: 0,
@@ -2140,7 +2153,8 @@ impl Player {
         let mut batched = edit::Batched::default();
         let mut jobs = Vec::new();
         let mut scratches = Vec::new();
-        let (mut skipped, mut hashed, mut uavs, mut merged) = (0, 0, 0, 0);
+        let (mut skipped, mut hashed, mut uavs, mut merged, mut scoped) = (0, 0, 0, 0, 0);
+        let (mut idle, mut lone) = (0, 0);
         let mut place = 0;
         let mut out = Vec::new();
         for s in &self.frame.submits {
@@ -2200,6 +2214,16 @@ impl Player {
                     (cmds, n) = edit::merge_barriers(cmds);
                     merged += n;
                 }
+                if o.idle_barriers > 0 {
+                    let of;
+                    (cmds, n, of) = edit::no_idle_uav_barriers(cmds, (o.idle_barriers > 1).then_some(&compute));
+                    idle += n;
+                    lone += of;
+                }
+                if o.scope_barriers > 0 {
+                    (cmds, n) = edit::scoped_uav_barriers(cmds, o.scope_barriers);
+                    scoped += n;
+                }
                 lists.push(cmds);
             }
             out.push(lists);
@@ -2226,6 +2250,20 @@ impl Player {
         if o.no_barriers {
             report.notes.push(format!(
                 "--no-barriers left out {uavs} unordered-access barriers"
+            ));
+        }
+        if o.idle_barriers > 0 {
+            report.notes.push(format!(
+                "--idle-barriers {}: {idle} of {lone} lone unordered-access barriers left out (no {} before them since the list's last wait)",
+                o.idle_barriers,
+                if o.idle_barriers > 1 { "compute work" } else { "shader work" }
+            ));
+        }
+        if o.scope_barriers > 0 {
+            report.notes.push(format!(
+                "--scope-barriers {}: {scoped} lone unordered-access barriers recorded as {}",
+                o.scope_barriers,
+                scope_name(o.scope_barriers)
             ));
         }
         if o.merge_barriers {
@@ -2851,9 +2889,19 @@ impl Player {
                     }
                 }
                 Cmd::Barriers { all } => {
-                    let all: Vec<D3D12_RESOURCE_BARRIER> =
-                        all.iter().filter_map(|b| self.barrier(b)).collect();
-                    barriers(l, &all);
+                    // An experiment's wait, recorded as an enhanced barrier.
+                    let done = if let [Barrier::Uav { flags, res: NONE }] = all[..]
+                        && flags & edit::SCOPED != 0
+                    {
+                        scoped(l, (flags & 0xff) as u32)
+                    } else {
+                        false
+                    };
+                    if !done {
+                        let all: Vec<D3D12_RESOURCE_BARRIER> =
+                            all.iter().filter_map(|b| self.barrier(b)).collect();
+                        barriers(l, &all);
+                    }
                 }
                 Cmd::Heaps { heaps } => {
                     let all: Vec<Option<ID3D12DescriptorHeap>> = heaps
@@ -3511,6 +3559,107 @@ fn uav_barrier(res: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
             }),
         },
     }
+}
+
+/// What `--scope-barriers <kind>` records in place of a wait for every
+/// earlier shader write: the stages waited for, the stages that wait, and the
+/// accesses before and after.
+fn scope(kind: u32) -> (D3D12_BARRIER_SYNC, D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS, D3D12_BARRIER_ACCESS) {
+    let (ua, read) = (D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+    match kind {
+        1 => (D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COMPUTE_SHADING, ua, ua),
+        2 => (D3D12_BARRIER_SYNC_ALL_SHADING, D3D12_BARRIER_SYNC_ALL_SHADING, ua, ua),
+        3 => (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL, ua, ua),
+        5 => (D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_ALL_SHADING, ua, read),
+        6 => (D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COMPUTE_SHADING, ua, read),
+        7 => (D3D12_BARRIER_SYNC_ALL_SHADING, D3D12_BARRIER_SYNC_ALL_SHADING, ua, read),
+        _ => (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COMMON),
+    }
+}
+
+fn scope_name(kind: u32) -> String {
+    match kind {
+        8 => return "unordered-access barriers that name a buffer".into(),
+        9 => return "enhanced barriers of a buffer, compute to compute".into(),
+        _ => {}
+    }
+    let (before, after, was, will) = scope(kind);
+    format!("global barriers, sync {:#x} -> {:#x}, access {:#x} -> {:#x}", before.0, after.0, was.0, will.0)
+}
+
+/// Records the enhanced global barrier of `kind` ([`scope`]); false, with
+/// nothing recorded, where lists have no enhanced barriers.
+///
+/// # Safety
+/// An open list.
+unsafe fn scoped(list: &ID3D12GraphicsCommandList, kind: u32) -> bool {
+    // 8 and 9: a wait that names a buffer (a small one of ours stands for the
+    // one the title named), as an unordered-access barrier and as an enhanced
+    // buffer barrier, compute to compute.
+    if kind == 8 || kind == 9 {
+        static BUFFER: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+        let buffer = BUFFER.get_or_init(|| {
+            let mut device: Option<ID3D12Device> = None;
+            // SAFETY: a question of a live list.
+            unsafe { list.GetDevice(&mut device) }.ok()?;
+            gpu::buffer(&device?, D3D12_HEAP_TYPE_DEFAULT, 65536, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+                .ok()
+                .map(|(buffer, _)| buffer)
+        });
+        let Some(buffer) = buffer else {
+            return false;
+        };
+        if kind == 8 {
+            // SAFETY: the caller's; a live buffer.
+            unsafe { list.ResourceBarrier(&[uav_barrier(Some(buffer))]) };
+            return true;
+        }
+        let Ok(list) = list.cast::<ID3D12GraphicsCommandList7>() else {
+            return false;
+        };
+        let all = [D3D12_BUFFER_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            // SAFETY: a borrowed pointer never released.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Offset: 0,
+            Size: u64::MAX,
+        }];
+        // SAFETY: the caller's; the group points at `all`, which lives through the call.
+        unsafe {
+            list.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pBufferBarriers: all.as_ptr(),
+                },
+            }]);
+        }
+        return true;
+    }
+    let Ok(list) = list.cast::<ID3D12GraphicsCommandList7>() else {
+        return false;
+    };
+    let (before, after, was, will) = scope(kind);
+    let all = [D3D12_GLOBAL_BARRIER {
+        SyncBefore: before,
+        SyncAfter: after,
+        AccessBefore: was,
+        AccessAfter: will,
+    }];
+    // SAFETY: the caller's; the group points at `all`, which lives through the call.
+    unsafe {
+        list.Barrier(&[D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pGlobalBarriers: all.as_ptr(),
+            },
+        }]);
+    }
+    true
 }
 
 /// Any placed resource to any other: waits for all writes.
