@@ -82,6 +82,40 @@ then tests those triangles itself, with the title's own triangle test, and
 visits no box node. What a ray costs falls from some tens of node tests,
 each with its loads, to a query and a few triangle tests.
 
+## Done so far
+
+- The translator's side (`VICTORY_RT_QUERY=1`, off by default; commit
+  a14c71c3): a box test of a node in title memory looks the node's address
+  up in a table that follows the directory of memory by address
+  (`shader::RT_ROOTS`: 16,384 entries of four dwords, one probe); for a root
+  the host has a structure for, `Lower::bvh_root` emits an inline ray query
+  (structure from the view heap at `base + RT_FIRST_SLOT + n`, every
+  triangle opaque, the ray's own origin, direction and extent) and returns
+  the nearest triangle's node as the box's one child. The DXIL validates.
+  Nothing fills the table yet, so nothing changes in a run.
+
+## The host's side, to write (`crates/victory-gpu/src/memory.rs`)
+
+- Which structures: the bottom levels a top-level build names in upload
+  memory (`named_in_upload`), and the packed ones the module already
+  follows (350 of the scene's 520 are in its `packed` map, with their going).
+  First only those marked rehydrated (0x8002: 543,000 of the 617,000
+  triangles); the compacted dynamic ones (0x8004, 64,000) once it is known
+  whether they are refitted.
+- The header (elements' offset and number) is whole only on the card: 64
+  bytes copied to a read-back buffer by a list of ours, read a frame later,
+  and asked again now and then (another structure at the address).
+- The leaves are not always one stretch of an arena (374 structures of 413
+  are; the 39 others hold a quarter of the triangles): they are copied page
+  by page into a scratch buffer, and the structure built from that with the
+  stride of 4 and the shared indices.
+- The build is recorded in the title's own list in front of the first trace
+  dispatch that comes after the header is known: the builder's unpacking
+  stages are in earlier lists by the title's order.
+- A top level of one instance for each, its view at the slot behind the
+  memory copies' in every heap that has their run, then the root's entry in
+  the table (the directory's memory, which goes up as it does today).
+
 Open, in the order they decide whether this works:
 
 1. (Settled, above: the leaves are one stretch, a triangle each.)
