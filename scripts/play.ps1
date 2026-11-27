@@ -14,12 +14,14 @@
 #               VIctory-Belobug-AMD cd8dfc0 and 2a8eed9 (README.md says where its DLL comes from)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 #               Light DRED is requested by default for diag and requires --features diagnostics.
+# -Binary       use a victory.exe built in a separate target directory, with the selected profile
 # -Warm         does not start the title: makes ahead, with this profile's settings, the pipelines
 #               earlier runs drew with (victory warm --used), so that the driver has them before
 #               a run needs one. Once after a change of the translator (a pull that says so) or
 #               of the graphics driver; seconds when the driver's cache has them already (2,748
-#               pipelines in 7 s on 2026-11-27), minutes when it has none. Translated shaders
-#               need nothing: they are kept between builds and made at first use otherwise.
+#               pipelines in 7 s on 2026-11-27), minutes when it has none.
+# -WarmShaders  fills the translated shader cache from the executable's directory with this
+#               profile's settings. Can be combined with -Warm to prepare shaders first.
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Console      series-x (the default: 3840x2160) or series-s: the title renders lower and
 #               scales up to 1920x1080 itself; on an RX 7700 XT 17-20 fps in the opening
@@ -35,8 +37,10 @@ param(
     [switch]$TextureStore,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [string]$Binary,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$Warm,
+    [switch]$WarmShaders,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -65,6 +69,16 @@ if ($RayTracing -or $RayTracingLow) {
     $settings.VICTORY_MEMORY_DIRECT = '1'
 }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
+if (-not ($RayTracing -or $RayTracingLow)) {
+    # Without ray tracing every ray of the title's misses, and the program that prepares the
+    # screen probes' rays (CS_ScreenProbes_ActivateRays, one dispatch) is the costliest single
+    # pass of a frame in the open world for nothing: it runs one frame in sixteen. A recorded
+    # frame of the open world replayed with and without it: 29.1 ms of the card against 30.9
+    # (RX 7700 XT, 2026-11-27); the picture the same by eye in two runs. This is the hash of
+    # that shader in the build measured; another build's is not found and nothing changes.
+    # -More @{VICTORY_PIPELINE_EVERY=''}: every frame, as before.
+    $settings.VICTORY_PIPELINE_EVERY = '39f0e9aeb156a61c:16'
+}
 if ($RayTracingLow) {
     # The title's 13 trace programs (those that test rays against its structures) each run
     # in one frame of three to six, by turns, and what they wrote stands in between; the
@@ -239,8 +253,9 @@ if ($Console -eq 'series-s' -and $settings.VICTORY_UPSCALER -eq '7' -and -not $s
     }
 }
 
-$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+$victory = if ($Binary) { $Binary } else { Join-Path $PSScriptRoot "..\target\$Build\victory.exe" }
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
+$victory = (Resolve-Path -LiteralPath $victory).Path
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
@@ -253,8 +268,22 @@ $discarded = $inherited | Where-Object {
 if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
-$Exe = (Resolve-Path $Exe).Path; $claim = if ($Warm) { $null } else { & (Join-Path $PSScriptRoot 'run-lock.ps1') -Take $Exe -Console $Console -Holder $PID }; if (-not $Warm -and -not $claim) { exit 1 }
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
+$prepareOnly = $Warm -or $WarmShaders
+$claim = if (-not $prepareOnly) { & (Join-Path $PSScriptRoot 'run-lock.ps1') -Take $Exe -Console $Console -Holder $PID }
+if (-not $prepareOnly -and -not $claim) { exit 1 }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
-    if ($Warm) { & $victory warm --used } else { & $victory run $Exe --execute --console $Console }
+    if ($WarmShaders) {
+        & $victory shaders (Split-Path -Parent $Exe)
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    if ($Warm) {
+        & $victory warm --used
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    if (-not $prepareOnly) {
+        & $victory run $Exe --execute --console $Console
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
 } finally { Pop-Location; if ($claim) { & (Join-Path $PSScriptRoot 'run-lock.ps1') -Release } }
