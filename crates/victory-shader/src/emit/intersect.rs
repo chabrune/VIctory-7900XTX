@@ -391,8 +391,22 @@ impl<'a> Lower<'a> {
         let same = self.s.m.cmp(c, pred::EQ, words[0], key);
         let same_top = self.s.m.cmp(c, pred::EQ, words[1], top);
         let root = self.s.m.bin(c, Bin::And, same, same_top);
-        let (asked, walked, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(c, Term::CondBr(root, asked, walked));
+        // The node's own test first, root or not: a ray that enters none of
+        // a root's boxes misses the structure, and the card is not asked
+        // (a ray crosses the boxes of many instances it does not touch; a
+        // query for each cost more than the walk it replaced, runs hw6 and
+        // hw7).
+        let boxes = self.bvh_boxes(at, kind, ray, sort);
+        let walked_end = self.cur;
+        let none = k(self, bvh::NONE);
+        let mut enters = self.s.m.cmp(walked_end, pred::NE, boxes[0], none);
+        for &b in &boxes[1..] {
+            let e = self.s.m.cmp(walked_end, pred::NE, b, none);
+            enters = self.s.m.bin(walked_end, Bin::Or, enters, e);
+        }
+        let ask = self.s.m.bin(walked_end, Bin::And, root, enters);
+        let (asked, join) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(walked_end, Term::CondBr(ask, asked, join));
         // The card's structure: one query to the nearest triangle.
         self.cur = asked;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
@@ -438,10 +452,6 @@ impl<'a> Lower<'a> {
         let pointer = self.s.m.bin(asked, Bin::Shl, node, k3);
         let found = self.s.m.select(asked, hit, pointer, miss);
         self.s.m.terminate(asked, Term::Br(join));
-        self.cur = walked;
-        let boxes = self.bvh_boxes(at, kind, ray, sort);
-        let walked_end = self.cur;
-        self.s.m.terminate(walked_end, Term::Br(join));
         self.cur = join;
         std::array::from_fn(|n| {
             let phi = self.s.m.phi(join, i32t);

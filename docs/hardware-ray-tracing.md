@@ -94,7 +94,35 @@ each with its loads, to a query and a few triangle tests.
   the nearest triangle's node as the box's one child. The DXIL validates.
   Nothing fills the table yet, so nothing changes in a run.
 
-## The host's side, to write (`crates/victory-gpu/src/memory.rs`)
+## In the title, 2026-11-27 (RX 7700 XT, Series S profile, the opening)
+
+Both sides run (`VICTORY_RT_QUERY=1`; `memory/rt.rs` is the host's): some
+900 structures of the host's alive in the first played scene, 600,000
+triangles, about 100 MB, built over the first seconds of the world; no
+device loss in six runs of 130-150 s, the room lit as without the switch
+(captures of different moments: not yet the same frame both ways).
+
+With the trace programs in every frame (`VICTORY_TRACE_EVERY=1`), one run
+each under the lock that keeps two games apart (hw14 without, hw13 with):
+
+| scene | without | with |
+|---|---|---|
+| 4,650-4,820 draws | 33.2 ms | 35.1 ms |
+| 5,600-6,800 draws (the heavy played scene) | 77-92 ms, the card waited for 39-52 ms | 50-54 ms, 10-14 ms |
+
+Per program the timing runs are too noisy to say more than this (a trace
+runs once in five frames there, and the cutscene moves): the largest
+(f22a76fcb967ee59) went from 4-11 ms a run to 2-7 in the played scene.
+
+What it does not do yet, and why the gain is not the 20 ms of the table at
+the top: the top level is still walked with the emulated test, a query is
+made for every instance whose root's boxes the ray enters (asked without
+that test first, the programs with long rays got slower: 3592426e3e9142d8
+1.9 ms to 4.1), every box node pays the look in the roots' table, and the
+structures that are not unpacked static ones (a tenth of the triangles) are
+walked as before.
+
+## The host's side (`crates/victory-gpu/src/memory/rt.rs`)
 
 - Which structures: the bottom levels a top-level build names in upload
   memory (`named_in_upload`), and the packed ones the module already

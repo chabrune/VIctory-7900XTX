@@ -25,8 +25,7 @@
 //! with memory.rs not seeing the first go, keeps its entry (wrong geometry
 //! until then). Only structures the module follows as packed ones are taken,
 //! and their entry goes when they do.
-//! shortcut: the host's structures are not compacted, and never given back
-//! while the title runs (their numbers are not used again).
+//! shortcut: the host's structures are not compacted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,8 +65,9 @@ enum Known {
     /// the host's structure `number`, and its entry's two key dwords and
     /// first triangle node.
     Built { number: u32, frame: u64, sent: Arc<AtomicBool>, key: [u32; 2], first: u32 },
-    /// Its entry is in the table at `entry`.
-    There { entry: u32 },
+    /// Its entry is in the table at `entry`, for the host's structure
+    /// `number`.
+    There { entry: u32, number: u32 },
 }
 
 #[derive(Default)]
@@ -81,8 +81,14 @@ pub(super) struct Rt {
     /// The host's structures by number: the top level a view shows, and the
     /// bottom level it holds.
     structures: Vec<(ID3D12Resource, ID3D12Resource)>,
-    /// Per view heap: how many structures have their view.
-    heaps: HashMap<usize, u32>,
+    /// The numbers of the structures made, in the order they were made (a
+    /// number is used again when its title structure went), and per view
+    /// heap how far down that list its views are written.
+    made: Vec<u32>,
+    heaps: HashMap<usize, usize>,
+    /// Numbers whose title structure went, and in which frame: used again
+    /// some frames later, when no list in the air asks the old one.
+    free: Vec<(u32, u64)>,
     frame: u64,
     asked: usize,
     built: u32,
@@ -155,12 +161,18 @@ impl Memory {
 
     /// The packed structure at `address` is gone: so is its root's entry.
     pub(super) fn rt_gone(&mut self, address: u64) {
-        if let Some(Known::There { entry }) = self.rt.known.remove(&address) {
-            let at = self.rt_entry(entry);
-            for n in 0..4 {
-                // SAFETY: an entry of the table, under the mutex.
-                unsafe { at.add(n).write_volatile(0) };
+        match self.rt.known.remove(&address) {
+            Some(Known::There { entry, number }) => {
+                let at = self.rt_entry(entry);
+                // (The second key dword first: the entry counts no more.)
+                for n in [1, 0, 2, 3] {
+                    // SAFETY: an entry of the table, under the mutex.
+                    unsafe { at.add(n).write_volatile(0) };
+                }
+                self.rt.free.push((number, self.frame));
             }
+            Some(Known::Built { number, .. }) => self.rt.free.push((number, self.frame)),
+            _ => {}
         }
     }
 
@@ -182,10 +194,10 @@ impl Memory {
         // The views of the structures made since this heap was last here.
         let key = std::ptr::from_ref(heap) as usize;
         let shown = self.rt.heaps.get(&key).copied().unwrap_or(0);
-        for (n, (top, _)) in self.rt.structures.iter().enumerate().skip(shown as usize) {
-            heap.structure_at(base + RT_FIRST_SLOT + n as u32, top);
+        for &number in &self.rt.made[shown..] {
+            heap.structure_at(base + RT_FIRST_SLOT + number, &self.rt.structures[number as usize].0);
         }
-        self.rt.heaps.insert(key, self.rt.structures.len() as u32);
+        self.rt.heaps.insert(key, self.rt.made.len());
         // Once a list: the copies and builds below are a frame's, not a
         // dispatch's.
         if !list.first_use(usize::MAX - 0x7274) {
@@ -320,7 +332,7 @@ impl Memory {
                 at.add(3).write_volatile(first);
                 at.add(1).write_volatile(key[1]);
             }
-            self.rt.known.insert(address, Known::There { entry });
+            self.rt.known.insert(address, Known::There { entry, number });
         }
     }
 
@@ -330,7 +342,13 @@ impl Memory {
     /// made.
     fn rt_build(&mut self, list: &HostList, address: u64, triangles: u32, first: u32, root: u32) -> Option<Known> {
         let host = host()?;
-        let number = self.rt.structures.len() as u32;
+        // A number whose structure went a while ago, or a new one.
+        let frame = self.frame;
+        let again = self.rt.free.iter().position(|&(_, went)| went + 8 <= frame);
+        let number = match again {
+            Some(i) => self.rt.free[i].0,
+            None => self.rt.structures.len() as u32,
+        };
         if number >= RT_STRUCTURES {
             return None;
         }
@@ -449,7 +467,13 @@ impl Memory {
             }
             self.rt.stats[0] += u64::from(triangles);
             self.rt.stats[1] += sizes.ResultDataMaxSizeInBytes + top_sizes.ResultDataMaxSizeInBytes;
-            self.rt.structures.push((tlas, blas));
+            if let Some(i) = again {
+                self.rt.free.swap_remove(i);
+                self.rt.structures[number as usize] = (tlas, blas);
+            } else {
+                self.rt.structures.push((tlas, blas));
+            }
+            self.rt.made.push(number);
         }
         // Told when the list is submitted: its structure exists from the
         // frames after that on.

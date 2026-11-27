@@ -142,7 +142,7 @@ fn build() -> [u8; 32] {
         }
         // The card's own ray tracing at structures' roots: as above.
         if victory_shader::emit::ray_queries() {
-            bytes.extend_from_slice(b"VICTORY_RT_QUERY=1");
+            bytes.extend_from_slice(b"VICTORY_RT_QUERY=1 (2)");
         }
         bytes
     });
