@@ -4251,6 +4251,10 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         }
         return true;
     }
+    // Light read out of a texture written as words and made for it.
+    if !unordered && view == crate::resource::R9G9B9E5 && crate::resource::castable_made(texture) {
+        return true;
+    }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
@@ -4442,6 +4446,9 @@ fn make_twinned(
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // (Light read out of a texture shaders write as words: a view
+            // of that texture, `crate::resource::cast_source`.)
+            let resource = crate::resource::cast_source(resource).unwrap_or(resource);
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it

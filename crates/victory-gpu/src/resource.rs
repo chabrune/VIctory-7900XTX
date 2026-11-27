@@ -2518,6 +2518,167 @@ pub(crate) fn is_resource(this: This) -> bool {
         && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
+/// DXGI_FORMAT_R32_UINT and DXGI_FORMAT_R9G9B9E5_SHAREDEXP.
+#[cfg(windows)]
+const R32_UINT: u32 = 42;
+#[cfg(windows)]
+pub(crate) const R9G9B9E5: u32 = 67;
+
+/// Whether a view the title places, as light (R9G9B9E5), in the memory of a
+/// texture its shaders write as words (R32_UINT) is a view of that texture
+/// itself (`VICTORY_ALIAS_CAST=1`; off by default), where the card allows a
+/// texture to be read in another format of the same texel width (relaxed
+/// format casting: the texture is made with the list of formats it may be
+/// read as).
+///
+/// On the console the two are one memory ([`alias_of`]). Here the view had a
+/// texture of its own, and every use of it copied the written texture into
+/// a buffer and the buffer into that texture (`crate::texture::alias`): 59
+/// to 77 such copies a frame, 1.4 ms of the card's time in a timing run on
+/// an RX 7700 XT (runs tm-nort and tm-rt, 2026-11-26), and as much card
+/// memory again as the written textures hold. One pair of formats is all
+/// the title has there (the sky, the sky and light probes, the bounced
+/// light). The card test is `crate::host::casting`.
+#[cfg(windows)]
+pub(crate) fn alias_cast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        use windows::Win32::Graphics::Direct3D12::*;
+        if !std::env::var_os("VICTORY_ALIAS_CAST").is_some_and(|v| v == "1") {
+            return false;
+        }
+        let Some(host) = crate::host::host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: a feature structure of its size.
+        let asked = unsafe { host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, (&raw mut options).cast(), size_of_val(&options) as u32) };
+        let can = asked.is_ok() && options.RelaxedFormatCastingSupported.as_bool() && windows::core::Interface::cast::<ID3D12Device10>(&host.device).is_ok();
+        tracing::info!(can, "views of light placed in textures written as words are views of those textures (VICTORY_ALIAS_CAST=1)");
+        can
+    })
+}
+
+/// For `this`, a texture made for a view of light the title placed in the
+/// memory of a texture its shaders write as words ([`alias_of`]): that
+/// written texture, if its host copy was made to be read as light
+/// ([`alias_cast`]). The view is then a view of it, and `this` needs no host
+/// copy. The same answer every time: the written texture's host copy is
+/// made here if it was not, and how it is made does not change.
+#[cfg(windows)]
+pub(crate) fn cast_source(this: This) -> Option<This> {
+    if this.is_null() || !alias_cast() {
+        return None;
+    }
+    let source = alias_of(this)?;
+    let format = pc_format(resource(this).desc.format);
+    let made = host_copy(source);
+    let castable = made.as_ref().is_some_and(|made| castable_made(&made.texture));
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if (format != R9G9B9E5 || !castable) && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+        // SAFETY: a live resource.
+        let own = made.as_ref().map(|made| unsafe { made.texture.GetDesc() });
+        tracing::info!(format, made = made.is_some(), castable, own = ?own.map(|d| (d.Format.0, d.Flags.0, d.Width, d.Height, d.MipLevels)), source_desc = ?resource(source).desc, "a placed view of a written texture is not cast");
+    }
+    (format == R9G9B9E5 && castable).then_some(source)
+}
+
+/// What marks a host texture made by [`castable_texture`] (private data of
+/// the resource: an address would name whatever is made there next).
+#[cfg(windows)]
+const CASTABLE: windows::core::GUID = windows::core::GUID::from_u128(0x6f1c5a0e_3b7d_4c56_9a41_52d0c8e7b113);
+
+/// Whether `texture` was made castable to light ([`castable_texture`]).
+#[cfg(windows)]
+pub(crate) fn castable_made(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    let (mut size, mut mark) = (1u32, 0u8);
+    // SAFETY: a live resource; a byte of ours of that size.
+    unsafe { texture.GetPrivateData(&CASTABLE, &mut size, Some((&raw mut mark).cast())) }.is_ok() && mark == 1
+}
+
+/// The host copy of a texture in R32_UINT that is a target or of unordered
+/// access, made so that it can be read through views in R9G9B9E5 too
+/// ([`alias_cast`]). `state`: the host state it starts in; `None` (and the
+/// texture is made as every other) if that is not one a layout stands for.
+#[cfg(windows)]
+fn castable_texture(
+    host: &crate::host::Host,
+    d: &ResourceDesc,
+    state: u32,
+    clear: Option<&[u32; 5]>,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    use windows::core::Interface;
+    let layout = match state {
+        0 => D3D12_BARRIER_LAYOUT_COMMON,
+        0x4 => D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+        0x8 => D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+        0x40 | 0x80 | 0xc0 => D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+        0x400 => D3D12_BARRIER_LAYOUT_COPY_DEST,
+        0x800 => D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+        _ => {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                tracing::info!(state = format_args!("{state:#x}"), "a texture written as words starts in a state no layout stands for: not castable");
+            }
+            return None;
+        }
+    };
+    let device = host.device.cast::<ID3D12Device10>().ok()?;
+    // SAFETY: the description has the host's layout (as where the others
+    // are made).
+    let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    let desc = D3D12_RESOURCE_DESC1 {
+        Dimension: plain.Dimension,
+        Alignment: plain.Alignment,
+        Width: plain.Width,
+        Height: plain.Height,
+        DepthOrArraySize: plain.DepthOrArraySize,
+        MipLevels: plain.MipLevels,
+        Format: plain.Format,
+        SampleDesc: plain.SampleDesc,
+        Layout: plain.Layout,
+        Flags: plain.Flags,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let formats = [DXGI_FORMAT(R32_UINT as i32), DXGI_FORMAT(R9G9B9E5 as i32)];
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: a description and a clear value of the host's layouts; the
+    // out pointer is ours.
+    let made = unsafe {
+        device.CreateCommittedResource3(
+            &heap,
+            crate::host::not_resident(),
+            &desc,
+            layout,
+            clear.map(|v| std::ptr::from_ref(v).cast()),
+            None::<&ID3D12ProtectedResourceSession>,
+            Some(&formats),
+            &mut texture,
+        )
+    };
+    if let Err(e) = &made {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!(error = %e, desc = ?d, "no castable host texture: made as the others"));
+        return None;
+    }
+    let texture = texture?;
+    if let Err(e) = crate::host::resident(&host.device, &texture).and_then(|()| crate::host::mapped(&host.device)) {
+        tracing::warn!(error = %e, desc = ?d, "a castable host texture is not resident");
+        return None;
+    }
+    // SAFETY: a live resource; a byte of ours.
+    unsafe { texture.SetPrivateData(&CASTABLE, 1, Some(std::ptr::from_ref(&1u8).cast())) }.ok()?;
+    static MADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!(width = d.width, height = d.height, state = format_args!("{state:#x}"), "a texture written as words is made castable to light");
+    }
+    Some(texture)
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2628,6 +2789,24 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
+        return Some(t);
+    }
+    // A texture shaders write as words, which the title reads as light
+    // through views it places in the texture's memory: made so that those
+    // views can be views of this texture ([`alias_cast`]).
+    if !reserved
+        && d.format == R32_UINT
+        && d.flags & (TARGET | UNORDERED) != 0
+        && d.sample_count <= 1
+        && alias_cast()
+        && let Some(t) = castable_texture(
+            host,
+            &d,
+            crate::host::legal_for(d.flags, crate::host::texture_state(state)),
+            clear_value.as_ref(),
+        )
+    {
+        crate::host::name(&t, || format!("texture {}x{} f{} flags {:#x} (castable to light)", d.width, d.height, d.format, d.flags));
         return Some(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
