@@ -99,6 +99,10 @@ struct Scene {
     there: bool,
 }
 
+/// Kinds of header the sweep's survey keeps apart; the ones past them are
+/// counted together (a structure's element count alone makes many kinds).
+const SURVEY_KINDS: usize = 16;
+
 #[derive(Default)]
 pub(super) struct Rt {
     known: HashMap<u64, Known>,
@@ -139,6 +143,30 @@ pub(super) struct Rt {
     /// structures turned down, entries whose place another root had.
     stats: [u64; 4],
     said: u64,
+    /// The headers the sweep read and did not take for a top level, by
+    /// (version, marks, elements): where the top levels may be hiding when
+    /// none is found, and how many headers were read in all.
+    survey: HashMap<(u32, u32, u32), u32>,
+    surveyed: u64,
+    /// The number of headers the survey last spoke at (0: not yet).
+    survey_said: u64,
+    /// Headers of kinds past the survey's limit, counted together.
+    survey_other: u32,
+}
+
+impl Rt {
+    /// A header the sweep read and did not take for a top level.
+    fn surveyed_header(&mut self, version: u32, marks: u32, elements: u32) {
+        self.surveyed += 1;
+        let kind = (version, marks, elements);
+        if let Some(count) = self.survey.get_mut(&kind) {
+            *count += 1;
+        } else if self.survey.len() < SURVEY_KINDS {
+            self.survey.insert(kind, 1);
+        } else {
+            self.survey_other += 1;
+        }
+    }
 }
 
 /// A buffer of the card's own memory in `state`.
@@ -200,6 +228,34 @@ impl Memory {
         // SAFETY: inside the directory's memory, which has the table behind
         // its entries when the switch is on (`table_bytes`).
         unsafe { self.directory.0.add((RT_ROOTS_AT / 4 + entry * 4) as usize) }
+    }
+
+    /// What the headers the sweep read were, when no top level has been
+    /// found: by version, marks and elements, at 64 headers and then at each
+    /// doubling of them (a few lines, not one a frame), so that the next
+    /// place to look for the title's top levels is in the log.
+    fn rt_survey(&mut self) {
+        let n = self.rt.surveyed;
+        if !self.rt.scenes.is_empty() || n < 64 || n < self.rt.survey_said.saturating_mul(2).max(64) {
+            return;
+        }
+        self.rt.survey_said = n;
+        let mut kinds: Vec<((u32, u32, u32), u32)> = self.rt.survey.iter().map(|(&kind, &count)| (kind, count)).collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1));
+        let kinds: Vec<String> = kinds
+            .iter()
+            .map(|&((version, marks, elements), count)| {
+                format!("{count}x version {version}, marks {marks:#x}, {elements} elements")
+            })
+            .collect();
+        tracing::info!(
+            "a top level of the title's, none yet (VICTORY_RT_SCENE=1): of {} headers swept, {} ({} other kinds not listed); {} of {} packed structures done",
+            n,
+            kinds.join("; "),
+            self.rt.survey_other,
+            self.rt.looked.len(),
+            self.packed_order.len(),
+        );
     }
 
     /// The packed structure at `address` is gone: so is its root's entry.
@@ -446,11 +502,13 @@ impl Memory {
                 if marks & 0x8000 != 0 || marks & 0x100 == 0 {
                     self.rt.looked.insert(address);
                 }
+                self.rt.surveyed_header(version, marks, h[3]);
                 continue;
             }
             let (count, root, elements) = (h[3], h[12], h[13]);
             if count == 0 || count > INSTANCES || !elements.is_multiple_of(64) {
                 self.rt.looked.insert(address);
+                self.rt.surveyed_header(version, marks, count);
                 continue;
             }
             let mut bytes = vec![0u8; count as usize * 128];
@@ -500,6 +558,7 @@ impl Memory {
             });
         }
         self.rt.sweep = at;
+        self.rt_survey();
         // The host's structure over the instances that have one of ours,
         // whenever that set changed (once a frame: it covers what is there
         // by then).
