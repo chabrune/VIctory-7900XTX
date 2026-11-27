@@ -876,3 +876,96 @@ should be worth, if the assumptions hold: the top level's box walk (1,590
 instances in the first played scene, up to 15 boxes deep) for one query, and
 with it the roots' queries of the instances the ray would never have
 reached.
+
+## The title's program names, and the map of its passes (2026-11-27)
+
+**Where the names are.** Not in the archives' tables but in the shader containers
+themselves: 18,206 of the 19,127 containers `VICTORY_SHADER_DUMP` wrote down (95 %)
+hold a printable program name, `<stage>_<family>_<variant, 8 hex>_Wrapped`, in their
+own bytes (`PS_..._Wrapped` at offset 0x175 of a 2 KiB container, between the input
+signature and the program's metadata). 4,494 distinct names among them. The same name
+is in the `SGD5` record's header, which `victory shaders <archive> -v` already prints
+beside the record's offset and the container's blake3 — so the catalogue of an archive
+can be had without a run.
+
+**The join.** Of the 721 containers that translate, 693 have a name: 334 pixel, 234
+mesh, 101 compute, 52 vertex programs, in 281 families (a family is the name without
+its variant suffix). The full table — hash, stage, name, family, console and host
+instruction counts — is written outside the repository by the two one-off scripts
+`shader-names.py` and `passes.py` in the cache folder (`passes.tsv`,
+`passes.md`, `carte-des-passes.md`).
+
+**What the mass is made of**, by static instruction count of the program (not by
+milliseconds: a heavy program may run once a frame — the two readings are joined in
+`docs/replay.md`'s per-program timing, which needs a capture):
+
+| pass (grouped by the words in the names) | families | programs | console inst | host inst | share |
+|---|---:|---:|---:|---:|---:|
+| ray tracing, probes and the light cache | 23 | 60 | 488,621 | 1,237,595 | 39.3 % |
+| opaque geometry and materials (deferred) | 80 | 209 | 364,484 | 883,285 | 28.1 % |
+| mirror reflections | 27 | 97 | 211,788 | 510,958 | 16.2 % |
+| depth, velocity and mask prepasses | 45 | 174 | 113,427 | 262,652 | 8.3 % |
+| shadows | 17 | 61 | 35,314 | 82,057 | 2.6 % |
+| culling, streaming, upkeep | 28 | 33 | 36,213 | 81,229 | 2.6 % |
+| others | 27 | 58 | 30,022 | 67,963 | 2.2 % |
+| post and picture | 29 | 29 | 10,065 | 23,039 | 0.7 % |
+
+One family is a third of the code on its own: 38 variants of the title's ray-tracing
+resolve, 456,246 console instructions translating to 1,152,621 host ones (36.6 % of
+all 3,148,778). The rest of the ray work (binning, miss, budgeting, the probe gathers
+and the irradiance cache) is small beside it — 23 families, 60 programs, and half of
+their instructions in the resolve.
+
+**Why it matters.** The layer already decides by these names, and only by them, for
+the three passes it stands in for: the screen-probe resolve, the radiance it keeps and
+the air's inscattering (`crate::ambient`), the exposure and the lux compression
+(`crate::lightprobe`). The map says which families are worth the same treatment: the
+resolve above all (a third of the shader code, and the pass the ambient stand-in and
+the card's ray tracing both aim at), then the mirror-reflection family (97 programs,
+16 %), which draws the same materials a second time, and the deferred material
+families (80 families, 209 programs), which are the picture and are not replaceable.
+
+**The name is read from the container now.** `dxbc::Container::program_name` finds the
+word (`<prefix>_<stage>_<family>_<variant>_Wrapped`, the prefix saying what made the
+container: `MSNC` and `MSR` for mesh pipelines, `TL` and `ptfx` for effects) in the
+container's own bytes; `victory translate <path> --list` and `victory shader-info <file>
+-v` print it beside the hash, and so does a `VICTORY_SHADER_CENSUS` line. (`inspect` is
+the PE image's summary and `shaders` translates every shader into the cache; neither is
+the survey.) Of 300 dumped containers taken at random, 283 carry one
+(94 %), none carried two different ones, and a bitcode identifier such as
+`tMixOutputCS_...` is not taken for a name (its stage is not a word of its own).
+
+**Not measured yet.** A per-program GPU cost for the frame. A replayed frame of the
+heavy played scene said where 19.4 ms of compute go (46 pipelines of 20 calls and more
+are 2.1 ms of it; 514 of one or two calls are 14.8), and `--timing detailed` names the
+costliest pipelines only; that capture was not kept.
+
+A frame of the first played scene was captured on 2026-11-27 (`VICTORY_RECORD` at 100 s,
+30 fps, 578 to 1,073 draws: 38 submissions, 219 lists, 49,000 resources, 1,026
+pipelines, 3.8 GB of the card's memory and 981 MB of CPU changes, 5.1 GB in the folder)
+and the replay lost the device before it timed anything: 53 lists had not been recorded
+whole (the recorder's own note: `VICTORY_RECORD_ALWAYS=1` is what the notes call for),
+and one placed 64 KiB buffer (`flags` 16, heap 56968, offset 0) could not be made again
+(`E_INVALIDARG`), after which making the descriptors found the device removed. So the
+next run must be recorded with `VICTORY_RECORD_ALWAYS=1` and the failing resource looked
+at in the replay's `notes.txt` before any per-program number is taken.
+
+**Seven more attempts recorded nothing (2026-11-27, 11:24 to 11:48).** Each run was made
+with `VICTORY_RECORD_ALWAYS=1`, wrote its `shaders.bin` and then ended before the 100 s
+mark, leaving no `notes.txt`: the title died within a minute, once with its own crash
+report and no error line before it. The card was not free for any of them. One of these
+runs (11:24) overlapped a run started at 10:58, in the cache's own `victory.log`, which
+had been going since before `scripts/run-lock.ps1` was written (`ff352b4d`) and whose
+side of the collision is a device suspended at 11:30; the later attempts overlapped
+runs of the same session that started at 11:38 onwards. The lock does refuse a second
+run once a claim exists, and it refused one here at 11:32 — but a run that began before
+the lock, or one from a worktree that ignores it, is invisible to it, so the check before
+a run has to look at the cache's logs too, not only at `run-lock.ps1`.
+
+So `capture-1` (11:01) is still the only frame of the title this tree has, and the
+per-program cost above is still not measured. The join is ready, though: `passes-cost.py`
+beside `passes.tsv` in the cache folder reads a replay's `--timing detailed` report, takes
+the DXIL hashes of each costliest pipeline, gives every program of that pipeline the
+pipeline's milliseconds (a mesh and a pixel program share their draw's) and sums them by
+family; it was checked against a report made up from three of `passes.tsv`'s own hashes
+and writes nothing of the title's outside that folder. What is left is one clean run.
