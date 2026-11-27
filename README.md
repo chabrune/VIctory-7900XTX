@@ -5,16 +5,23 @@ that runs an Xbox Series title natively on Windows from files the user supplies.
 
 ## The goal
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+**The Series X version at 4K output (drawn at 1440p) with ray tracing on,
+looking the way it does on the Xbox**, on an AMD RX 7900 XTX first.
+
+In this order:
+
+1. **A correct picture.** Textures and models reach full detail and stay there
+   (no pop-in or pop-out, no flickering trees), and ray-traced lighting is right:
+   not too dark, not too bright, no flicker.
+2. **Then the frame rate:** 30 fps or more with ray tracing on, then as high a
+   frame rate and as low frame times as the PC allows.
+3. **Then smaller PCs:** 32 GB (later 16 GB) of RAM and smaller cards.
 
 The way there is **porting, not emulating**: patching the title's renderer so it
 behaves the way a PC renderer does, rather than having the layer watch and copy
 the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+into a versioned store that is kept between builds. The Series S profile and
+ray tracing off stay available.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
@@ -23,7 +30,31 @@ or publisher.
 ## Where it stands (2026-11-26)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
+RX 7900 XTX (24 GB of dedicated video memory), renderer patches 1, 2, 5, 6 and 7 on. Runs of 270 s in a city
+street: standing still, then walking and turning the camera.
+
+| Version | Standing | Walking | RAM |
+|---|---|---|---|
+| **Series X, 4K drawn at 1440p, ray tracing on (the goal)** | 99 ms (10 fps) | ~110 ms (9 fps) | 45 GB |
+| Series X, 4K drawn at 1440p, ray tracing off | 49 ms (20 fps) | ~62 ms (16 fps) | 45 GB |
+| Series X, 1080p output, ray tracing off | 40 ms (25 fps) | ~43 ms (23 fps) | 42 GB |
+| Series S, ray tracing off | 43 ms (23 fps) | ~64 ms (16 fps) | 37 GB |
+
+Fixed 2026-11-26: trees and palms dropping out for a few frames, and most of the
+lighting swinging between too dark and too bright in lamp-lit rooms. Both came from
+indirect draws whose arguments sit in renderer patch 1's in-place memory being
+prepared before the title's culling had written them; they are now prepared one at
+a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
+2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
+(`VICTORY_AMBIENT_RT=0.7,1.5`, which `Play-Watched.ps1 -RayTracing` sets).
+
+Still open: models and textures stay at their lowest detail for a long time while
+the title streams (worst in the intro): the title paces its streaming by its own
+frames, so it loads about three times slower at 10 fps than at 30; ray-traced
+structures of moving objects are partly corrupt (the rays follow some 450 stray
+pointers a frame).
+
+Earlier measurements with ray tracing off:
 
 | | |
 |---|---|
@@ -38,6 +69,18 @@ RX 7900 XTX, ray tracing off.
 It started at 280 ms a frame in the same scenes three days earlier. What sets
 the frame now is the one thread that submits the title's work to the card
 (about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+
+### Reports from other GPUs
+
+| GPU and build | What the contributor observed |
+|---|---|
+| Radeon RX 9060 XT (16 GB), `cd8dfc0` with local changes | In the same Series X interior at 1080p, the game averaged 19.8 fps with ray tracing off and 15.6 fps with it on. Indirect lighting showed white patches and dark smears. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/313) |
+| GeForce RTX 3090 (24 GB), `a-publier@cd8dfc0` | The prison rendered. Two warm Series S runs averaged 545 and 532 ms per frame. The contributor reported 10.0 and 10.2 GB of VRAM in those runs. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/333) |
+| Intel Arc B580 (12 GB), revision unreported | Startup and initial menu navigation worked. Further menu interaction slowed to about 0.7 fps before D3D12 device removal. [Crash report](https://github.com/Belobug/VIctory-Belobug-AMD/issues/98) |
+
+The 10.5 GB of VRAM in the RX 7900 XTX table is the usage reported for that run.
+Memory use and frame time depend on the scene and settings. The [ray-tracing notes](docs/fork-ray-tracing.md)
+describe which lighting paths run and the remaining rendering issues.
 
 ### Renderer patches (off by default while they are tested)
 
@@ -58,6 +101,7 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| `VICTORY_KBM_GTA=1` | Optional GTA V PC-style keyboard and mouse mapping on the stand-in pad: `F2` or `` ` `` (`~`) toggles mouse-look and auto-hides the cursor while locked (`Esc`/`P`/focus loss unlocks and restores it), LMB/RMB = RT/LT, MMB/`C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad Right, `V` = View. Tune with `VICTORY_MOUSE_SENS` (default `1.0`) and `VICTORY_MOUSE_INVERT_Y=1` (or pass via `scripts\play.ps1 -More @{VICTORY_KBM_GTA='1'}`) |
 
 What is known to be wrong:
 
@@ -82,6 +126,11 @@ copy victory.example.toml victory.toml      # then set your paths, outside this 
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
 ```
+
+The launcher requests light device removal diagnostics (DRED) by default with
+`-Build diag`. DRED requires `--features diagnostics`. For a release binary
+built with that feature, request DRED with
+`-Build release -More @{VICTORY_D3D12_DRED='light'}`.
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
@@ -113,6 +162,10 @@ For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
 and `performance` selects 1920×1080. All three output 3840×2160. With
 `victory run` directly, set `VICTORY_FSR_4K` to the preset name.
+AMD's SDK offers FSR 4.1.2 for some cards only. Where it does not, the
+newest FSR 3.1 it offers is used in its place and the log says so; its
+picture differs from FSR 4's. Where it offers neither, the run stops
+before the title starts and names the versions that were offered.
 The log reports the provider at context creation and the actual input and
 output sizes at the first successful temporal dispatch. The title profile
 and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).

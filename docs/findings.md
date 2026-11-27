@@ -773,3 +773,56 @@ and 9 windows placed in two runs; here 0 of 789 windows are one run of a section
 an RX 9070); DexNom after its bridge has README commits only; Belobug `main` is its
 older line (5 to 7 fps), Leonida does not start the title, and the remotes of cool_fox
 and Leonida are gone.
+
+### 2026-11-27 (morning): what the others pushed overnight, and a crash it uncovered
+
+**Taken.** avatarmanz `main` to 014d52d (15 commits, no conflict): the ordering of
+in-place indirect arguments, `VICTORY_AMBIENT_RT`, `VICTORY_BVH_FAULTS_ALL`, renderer
+port RT part 1, renderer port 2's table copies. Belobug `a-publier` to 4eb6cfd (28
+commits): `-Fsr4K` with FSR 3.1 where there is no 4.1.2, a size query not reused in
+translated shaders (`TRANSLATOR_VERSION` 2), PC-style keys (`VICTORY_KBM_GTA=1`, beside
+the settings file's bindings), the profiler's stack walk. Of the translator fixes
+listed above, ported by hand onto this tree's `lower.rs`: Marvisak cc7ec2a (64-bit
+integer compares on their two dwords: AMD's D3D12 compiler orders them as if the dwords
+were swapped) and e04c078 (a program's constant table starts after its instructions),
+and DexNom 76749ce as it was.
+
+**Measured.**
+
+- `VICTORY_PORT_CONSTANTS_ORDER` (on by default upstream) costs 9 ms a frame here:
+  40.0, 41.4, 41.0 and 41.3 ms a frame with it against 31.7, 32.2 and 32.4 without, by
+  turns of ten seconds in one run (up-merge1, the first played scene, 4,450 to 4,700
+  draws). 1,440 indirect executions a frame have their arguments in renderer port 1's
+  memory there, and each clamped alone is a dispatch of ours and a wait of its own. The
+  Series S profile leaves it off; what it steadies (trees and lamp-lit rooms that drop
+  out for a frame) wants a cheaper form.
+- `VICTORY_PORT_RT=1`: 31.9, 31.7, 30.8 and 30.5 ms a frame against 31.1, 30.6 and
+  31.3 (run next4). Nothing.
+
+**The title ends itself at the world's start when a cache is cold.** It writes its
+crash report ("Unsignaled CrossQueueBarrier") when nothing was presented for 30 s. With
+`-RayTracingLow` every pipeline's shaders were translated at first use on the thread
+that records the title's lists, to learn whether they trace, and the structure
+builder's 53 programs were made there one after the other. With the translations in
+the cache that is nothing. With none there the first frame of the world took 33 s (run
+bel-merge2: frame 1953 from 04:29:55 to the report at 04:30:28, 338 shaders translated
+one after the other meanwhile); the report of 2026-11-26 19:18, from a release build
+started with `-RayTracingLow`, has the same camera, the same place and 38 s. The cache
+is cold after a new `TRANSLATOR_VERSION`, and for any switch that is part of its key
+(`shader_cache.rs`): `victory shaders` run without the profile's `VICTORY_PORT_CBV=1`
+fills a key the title does not read (185 s for 25,790 shaders, of no use). Now a
+pipeline is asked whether it traces once the worker that makes it has translated it
+(`VICTORY_TRACE_ASK_LATE=0`: as before), and the builder asks the workers for its
+programs and rests until they are made (`VICTORY_BVH_BUILDER_NOW=1`: as before): with
+the same cold cache the world starts with five seconds at 266 ms a frame, the builder
+runs 0.8 s later, and no report is written (run cold3).
+
+**Looked at and left.** fxceless's `VICTORY_GPU_DETILE` (3461f52: textures detiled on
+the card by a pass in the prelude) could be brought over, a module of its own beside
+the prelude's uploads, but what it takes off the preparing thread here is the 0.6 to
+0.9 ms a frame of the frame line's "textures", fxceless gives no figure and leaves it
+off, and it is one more pass for the card. Its 83a5593 is here already
+(`Staging::fill`). Its f6a09d3 (the legacy multiply-add fused, its three sources
+flushed) is more work for the card in an instruction every shader has: behind a switch
+and measured, or not at all. Marvisak 7ac1f54 (the seed of the ordered section's
+collision id) meets another form of that code here.
