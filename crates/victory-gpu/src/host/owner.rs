@@ -389,7 +389,9 @@ fn open(shadow: &Shadow, who: Option<Who>) {
     COUNT.fetch_sub(1, Relaxed);
     STATS[4].fetch_sub(len, Relaxed);
     // (Only an access of our own code leaves it to be asked again:
-    // [`again`].)
+    // [`again`]. Tried for what the kernel writes there too, 2026-11-27:
+    // 46 copies taken again in a run against 15 and as many compare passes
+    // a frame, 330 against 313: the title reads files into them again.)
     shadow.owner_opened(who.is_some_and(|who| who.2));
     let (site, kind, ours, stack) = who.unwrap_or((0, 2, true, 0));
     STATS[if ours { 3 } else { 2 }].fetch_add(1, Relaxed);
