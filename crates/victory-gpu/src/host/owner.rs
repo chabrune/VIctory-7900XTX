@@ -193,9 +193,9 @@ impl Pager {
             list.CopyBufferRegion(buffer, 0, &shadow.buffer, at, len);
             list.Close().ok()?;
             let lists = [Some(list.cast::<ID3D12CommandList>().ok()?)];
-            host.queue.ExecuteCommandLists(&lists);
+            host.queue().ExecuteCommandLists(&lists);
             self.sent += 1;
-            host.queue.Signal(&self.fence, self.sent).ok()?;
+            host.raw_queue.Signal(&self.fence, self.sent).ok()?;
             self.fence.SetEventOnCompletion(self.sent, self.event).ok()?;
             WaitForSingleObject(self.event, INFINITE);
         }

@@ -137,7 +137,7 @@ impl Host {
                 _back: back,
                 data: data as usize,
                 lists,
-                ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
+                ticks_per_ms: self.raw_queue.GetTimestampFrequency()? as f64 / 1000.0,
                 next: 0,
                 sums: Sums::default(),
             })

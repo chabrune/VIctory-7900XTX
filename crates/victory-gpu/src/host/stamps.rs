@@ -84,10 +84,10 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
     let (mut card, mut pc) = (0, 0);
     // SAFETY: plain queries; the mapping holds twice `MOST` tick counts.
     let (frequency, back) = unsafe {
-        if host.queue.GetClockCalibration(&mut card, &mut pc).is_err() {
+        if host.raw_queue.GetClockCalibration(&mut card, &mut pc).is_err() {
             return Vec::new();
         }
-        let frequency = host.queue.GetTimestampFrequency().unwrap_or(0);
+        let frequency = host.raw_queue.GetTimestampFrequency().unwrap_or(0);
         (frequency, std::slice::from_raw_parts(stamps.back as *const u64, 2 * MOST))
     };
     if frequency == 0 {
@@ -137,7 +137,7 @@ impl Host {
                 lists.push(list.cast()?);
             }
             let (mut card, mut pc) = (0, 0);
-            self.queue.GetClockCalibration(&mut card, &mut pc)?;
+            self.raw_queue.GetClockCalibration(&mut card, &mut pc)?;
             Ok(Stamps {
                 lists,
                 back: back as usize,
@@ -170,8 +170,8 @@ mod tests {
             // SAFETY: closed lists; the fence and event are the host's, under
             // its lock.
             unsafe {
-                host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
-                host.queue.Signal(&host.fence, *submitted).unwrap();
+                host.queue().ExecuteCommandLists(&[Some(ahead), Some(behind)]);
+                host.raw_queue.Signal(&host.fence, *submitted).unwrap();
                 host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
                 WaitForSingleObject(host.event, INFINITE);
             }

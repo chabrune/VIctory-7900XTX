@@ -224,7 +224,7 @@ impl Paged {
             }
             let tiles: u32 = runs.iter().map(|run| run.1).sum();
             if let Some(heap) = heap_at(index) {
-                map_runs(&host.queue, &buffer, first, tiles, &heap, &runs);
+                map_runs(host.queue(), &buffer, first, tiles, &heap, &runs);
             }
             for &(start, count) in &runs {
                 own.extend((start..start + count).map(|tile| (index as u32, tile)));
@@ -259,7 +259,7 @@ impl Paged {
         let Some(heap) = heap_at(index as usize) else {
             return false;
         };
-        map_runs(&host.queue, &self.buffer, page, 1, &heap, &[(tile, 1)]);
+        map_runs(host.queue(), &self.buffer, page, 1, &heap, &[(tile, 1)]);
         let mut lent = self.lent.lock().unwrap_or_else(|e| e.into_inner());
         lent[page as usize / 64] |= 1 << (page % 64);
         STATS[6].fetch_add(1, Relaxed);
@@ -282,7 +282,7 @@ impl Paged {
         let Some(heap) = heap_at(index as usize) else {
             return false;
         };
-        map_runs(&host.queue, &self.buffer, page, 1, &heap, &[(tile, 1)]);
+        map_runs(host.queue(), &self.buffer, page, 1, &heap, &[(tile, 1)]);
         STATS[7].fetch_add(1, Relaxed);
         true
     }

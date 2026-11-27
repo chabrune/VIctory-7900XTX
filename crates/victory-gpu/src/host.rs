@@ -40,7 +40,11 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    /// The drawing queue. Calls of ours on it go through [`Host::queue`],
+    /// which waits for the lists handed to the sending thread before them
+    /// (`sender::join`); only that thread, and calls that put nothing in
+    /// the queue's order, name it directly.
+    raw_queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -1095,7 +1099,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
-            queue,
+            raw_queue: queue,
             fence,
             submitted: Mutex::new(0),
             event,
@@ -4473,7 +4477,7 @@ impl Host {
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
-        let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        let _ = unsafe { self.raw_queue.Signal(&clock.fence, state.0) };
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
@@ -4662,7 +4666,7 @@ impl Host {
                         // the copy queue; the sends come from there.
                         if looks.is_none() && upq::on() {
                             let (memory, used) = own.source();
-                            up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {});
+                            up = upq::send(self, self.queue(), &[(memory, 0, memory, used)], |_, _, _| {});
                         }
                         let from = up.as_ref().and_then(upq::Slot::bounce);
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)), from);
@@ -4678,7 +4682,7 @@ impl Host {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
-                        up = upq::send(self, &self.queue, &ranges, |i, bounce, at| {
+                        up = upq::send(self, self.queue(), &ranges, |i, bounce, at| {
                             let (card, offset, _, bytes) = ranges[i];
                             list.CopyBufferRegion(card, offset, bounce, at, bytes);
                         });
@@ -4753,7 +4757,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    self.queue().ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
             };
@@ -5177,12 +5181,15 @@ impl Host {
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
+                // (Behind what the sending thread still holds: asked for
+                // before the lock, which that thread never takes.)
+                sender::join();
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                self.queue().ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                self.raw_queue.Signal(&fence, sent)?;
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
@@ -5472,10 +5479,13 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    // (Under the submission lock: no end of a submission is
+                    // handed to the sending thread between the join and the
+                    // signal, whose value is the next one.)
+                    self.queue().ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    self.raw_queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -6147,12 +6157,20 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // The end of a submission sent ahead (this wait, the slots that
+        // waited, the lists given to the queue) is the sending thread's if
+        // that is asked for (`VICTORY_SUBMIT_AFTER`, `sender::After`): this
+        // thread goes on to the next submission meanwhile.
+        let after = late && sender::after();
+        let mut heaps_synced = Some(heaps_synced);
+        if !after {
+            let heaps_began = std::time::Instant::now();
+            drop(heaps_synced.take());
+            crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+            // The slots that waited for a texture's host copy, before the
+            // lists that may read them run.
+            crate::descriptor::make_waiting();
+        }
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -6182,12 +6200,13 @@ impl Host {
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
             let execute = |lists: Vec<Option<ID3D12CommandList>>, cuts: Vec<usize>| unsafe {
+                let queue = self.queue();
                 let mut from = 0;
                 for to in cuts.iter().copied().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
-                self.queue.Signal(&self.fence, *submitted)
+                queue.Signal(&self.fence, *submitted)
             };
             // On a thread of its own if that is asked for (`VICTORY_SUBMIT_TWO`):
             // the submission lock is held until it has given the lists to the
@@ -6195,7 +6214,35 @@ impl Host {
             // preparation asks about are as they are here.
             let mut sent_there: Option<windows::core::Result<()>> = None;
             let mut sent_here: Option<windows::core::Result<()>> = None;
-            if sender::on() {
+            // The whole end of the submission with the sending thread, and
+            // nobody waiting for it here.
+            let mut handed = false;
+            let mut preludes = preludes;
+            if let Some(heaps) = heaps_synced.take() {
+                let end = sender::After {
+                    batches: sender::Batches { lists, cuts, value: *submitted },
+                    heaps,
+                    heaps_on,
+                    preludes: std::mem::take(&mut preludes),
+                    #[cfg(feature = "diagnostics")]
+                    sending,
+                    #[cfg(feature = "diagnostics")]
+                    stamp,
+                };
+                match sender::hand_after(end) {
+                    Ok(()) => handed = true,
+                    // (No thread to take it: done here, as without the switch.)
+                    Err(end) => {
+                        let end = *end;
+                        let heaps_began = std::time::Instant::now();
+                        drop(end.heaps);
+                        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+                        crate::descriptor::make_waiting();
+                        preludes = end.preludes;
+                        sent_here = Some(execute(end.batches.lists, end.batches.cuts));
+                    }
+                }
+            } else if sender::on() {
                 let batches = sender::Batches { lists, cuts, value: *submitted };
                 match sender::hand(batches) {
                     Ok(Some(result)) => {
@@ -6211,11 +6258,13 @@ impl Host {
                 sent_here = Some(execute(lists, cuts));
             }
             let signalled = sent_there.or(sent_here).unwrap_or(Ok(()));
-            give_preludes(preludes);
-            awake::sent(&self.device);
-            #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
+            if !handed {
+                give_preludes(preludes);
+                awake::sent(&self.device);
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::sent(sending, *submitted, stamp);
+                self.card_sent();
+            }
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6266,10 +6315,10 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue().ExecuteCommandLists(group);
                 self.card_sent();
                 let waited = self
-                    .queue
+                    .raw_queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
@@ -6297,7 +6346,7 @@ impl Host {
                 let mut noted = 0.0;
                 if let crate::copystat::Timed::Title(run) = _kind {
                     // SAFETY: a plain query.
-                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let frequency = unsafe { self.raw_queue.GetTimestampFrequency() }.unwrap_or(1);
                     for (ms, op) in runs[run].slowest(frequency, usize::MAX) {
                         crate::copystat::command_took(&op, ms);
                         noted += ms;
@@ -6311,7 +6360,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let (true, crate::copystat::Timed::Title(i)) = (timing() && started.elapsed() > std::time::Duration::from_millis(50), _kind) {
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = unsafe { self.raw_queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
                 for (ms, op) in runs[i].slowest(frequency, 6) {
@@ -8144,6 +8193,16 @@ fn split_line(frames: f64) {
         e[0],
         e[1] / 1e3,
     );
+    {
+        let [ends, joins, us] = [0, 1, 2].map(|i| sender::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if ends > 0.0 {
+            tracing::info!(
+                "ends of submissions done by the sending thread per frame (VICTORY_SUBMIT_AFTER=1: the wait for the heaps' records, the \
+                 slots that waited, the lists given to the queue): {ends:.1}; calls on the queue that waited for it: {joins:.1}, {:.2} ms",
+                us / 1e3
+            );
+        }
+    }
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
@@ -9341,8 +9400,12 @@ impl Host {
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
     /// given memory ahead of the list that uploads them).
+    ///
+    /// What the sending thread was handed before is in the queue first
+    /// (`sender::join`): the queue's order is the order of the calls.
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
-        &self.queue
+        sender::join();
+        &self.raw_queue
     }
 
     /// A buffer in the upload heap, mapped for writing.
@@ -10206,6 +10269,8 @@ impl Host {
             } else {
                 (0, DXGI_PRESENT(0))
             };
+            // (The copy of the picture may still be with the sending thread.)
+            sender::join();
             let status = p.swap_chain.Present(interval, flags);
             showing.next("the frame cap");
             if let Some(period) = wanted.frame_period() {
@@ -10282,7 +10347,7 @@ impl Host {
             // path on Windows 10 and 11 instead: no compositor in between,
             // tearing and variable refresh allowed.
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                .CreateSwapChainForHwnd(&self.raw_queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
             if let Err(e) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
                 tracing::warn!(error = %e, "DXGI's own Alt+Enter is still on");
