@@ -113,14 +113,19 @@ fn rays_a_second_through_the_cards_own_structures() {
         return;
     };
     let device5: ID3D12Device5 = device.cast().unwrap();
-    for triangles in [100_000u32, 1_000_000, 4_000_000] {
+    // `nodes`: the triangles lie as the title's leaves do, one in the first
+    // 36 bytes of each 64-byte node, and the structure is built from them
+    // where they are: vertices 4 bytes apart (the stride may be any
+    // multiple of a component), and indices 16 i, 16 i + 3, 16 i + 6.
+    for (triangles, nodes) in [(100_000u32, false), (100_000, true), (1_000_000, false), (1_000_000, true), (4_000_000, false)] {
         // SAFETY: plain creation, recording and execution of objects of the
         // test's own; nothing is read before the fence is reached.
         unsafe {
             const SIDE: f32 = 100.0;
             // Triangles of about `edge` a side, at random in the cube.
             let edge = SIDE / (triangles as f32).cbrt() * 1.5;
-            let (vertices, data) = host.upload_buffer(u64::from(triangles) * 36).unwrap();
+            let each = if nodes { 64 } else { 36 };
+            let (vertices, data) = host.upload_buffer(u64::from(triangles) * each as u64).unwrap();
             let mut x = 0x1234_5678u32;
             let mut next = || {
                 x ^= x << 13;
@@ -128,13 +133,22 @@ fn rays_a_second_through_the_cards_own_structures() {
                 x ^= x << 5;
                 (x & 0xff_ffff) as f32 / 16_777_216.0
             };
-            let floats = std::slice::from_raw_parts_mut(data.cast::<f32>(), triangles as usize * 9);
-            for t in floats.chunks_exact_mut(9) {
+            let floats = std::slice::from_raw_parts_mut(data.cast::<f32>(), triangles as usize * each / 4);
+            for t in floats.chunks_exact_mut(each / 4) {
+                // (What a node holds past its triangle is not the structure's.)
+                t[9..].fill(f32::NAN);
                 let at = [next() * SIDE, next() * SIDE, next() * SIDE];
                 for v in 0..3 {
                     for c in 0..3 {
                         t[3 * v + c] = at[c] + (next() - 0.5) * edge;
                     }
+                }
+            }
+            let (indices, index_data) = host.upload_buffer(u64::from(triangles) * 12).unwrap();
+            if nodes {
+                let all = std::slice::from_raw_parts_mut(index_data.cast::<u32>(), triangles as usize * 3);
+                for (i, t) in all.chunks_exact_mut(3).enumerate() {
+                    t.copy_from_slice(&[16 * i as u32, 16 * i as u32 + 3, 16 * i as u32 + 6]);
                 }
             }
             let geometry = D3D12_RAYTRACING_GEOMETRY_DESC {
@@ -143,12 +157,15 @@ fn rays_a_second_through_the_cards_own_structures() {
                 Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
                     Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
                         Transform3x4: 0,
-                        IndexFormat: DXGI_FORMAT_UNKNOWN,
+                        IndexFormat: if nodes { DXGI_FORMAT_R32_UINT } else { DXGI_FORMAT_UNKNOWN },
                         VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
-                        IndexCount: 0,
-                        VertexCount: triangles * 3,
-                        IndexBuffer: 0,
-                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE { StartAddress: vertices.GetGPUVirtualAddress(), StrideInBytes: 12 },
+                        IndexCount: if nodes { triangles * 3 } else { 0 },
+                        VertexCount: if nodes { triangles * 16 } else { triangles * 3 },
+                        IndexBuffer: if nodes { indices.GetGPUVirtualAddress() } else { 0 },
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vertices.GetGPUVirtualAddress(),
+                            StrideInBytes: if nodes { 4 } else { 12 },
+                        },
                     },
                 },
             };
@@ -242,9 +259,10 @@ fn rays_a_second_through_the_cards_own_structures() {
             device.GetDeviceRemovedReason().ok().expect("the device after the builds");
             for rays in [1u32 << 20, 1 << 22, 1 << 24] {
                 let mut best = std::time::Duration::MAX;
-                let mut hits = 0;
+                let (mut hits, mut sum) = (0, 0);
                 for turn in 0..4u32 {
                     back.cast::<u32>().write_volatile(0);
+                    back.cast::<u32>().add(1).write_volatile(0);
                     allocator.Reset().unwrap();
                     list.Reset(&allocator, None).unwrap();
                     list.SetComputeRootSignature(&root);
@@ -255,9 +273,11 @@ fn rays_a_second_through_the_cards_own_structures() {
                     list.Dispatch(rays.div_ceil(GROUP), 1, 1);
                     best = best.min(run(&list));
                     hits = back.cast::<u32>().read_volatile();
+                    sum = back.cast::<u32>().add(1).read_volatile();
                 }
                 println!(
-                    "{triangles} triangles (structure {} MB, built in {:.1} ms): {rays} rays in {:.2} ms, {:.0} million a second, {:.0} % hit",
+                    "{}{triangles} triangles, hits' sum {sum} (structure {} MB, built in {:.1} ms): {rays} rays in {:.2} ms, {:.0} million a second, {:.0} % hit",
+                    if nodes { "in 64-byte nodes: " } else { "" },
                     blas_bytes >> 20,
                     built.as_secs_f64() * 1e3,
                     best.as_secs_f64() * 1e3,
@@ -266,7 +286,7 @@ fn rays_a_second_through_the_cards_own_structures() {
                 );
             }
             device.GetDeviceRemovedReason().ok().expect("the device after the traces");
-            drop((vertices, scratch, top_scratch, instances));
+            drop((vertices, indices, scratch, top_scratch, instances));
         }
     }
 }

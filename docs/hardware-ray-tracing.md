@@ -39,6 +39,36 @@ hit, through one bottom-level structure of small triangles strewn in a cube
 A million rays in 2.6 to 8 ms. How many rays the title's programs trace a
 frame is not measured yet (their dispatches are indirect).
 
+## What the title's structures hold (a dump of the arenas, run bld1)
+
+The first played scene, 2026-11-27, ray tracing low: the main top level has
+1,590 instances of 520 bottom-level structures (a second one 302 of 90).
+Those 520 hold 603,685 triangles in all (1.79 million counted once an
+instance; the largest 47,877, most a few hundred), under 210,834 box nodes
+of 128 bytes and 31,068 of 64, up to 15 deep.
+
+**Every triangle is a node of its own, in one stretch.** A bottom level's
+header gives the offset of its elements (dword 13) and their number (dword
+3); element `i` is the 64-byte node at that offset plus 64 i, its triangle
+the node's first three vertices (bytes 0-35), named by the pointer
+`(offset / 64 + i) << 3` of kind 0. Of 603,673 triangles reached from the
+roots, 603,626 are so; the rest (kinds 1-3, or outside the stretch) belong
+to the few dynamic structures that are written over each other
+(`fork-ray-tracing.md`, known gaps).
+
+An instance is 128 bytes at the top level's elements: the matrix in dwords
+0-11, dword 14 the bottom level's root pointer with flags in its high bits,
+dword 15 the bottom level's address in 256-byte units.
+
+**So the card's structure can be built from the title's leaves where they
+lie**, with no pass to gather vertices: vertex stride 4 bytes (any multiple
+of a component is allowed), 32-bit indices 16 i, 16 i + 3, 16 i + 6.
+`host::hwrt` does it both ways: the same hits to the last one, the same
+speed, twice the build time (7.6 ms for 100,000 triangles, 130 ms for a
+million). The primitive a ray query returns is `i`: the title's node pointer
+follows by arithmetic. For 600,000 triangles the card's structures take
+about 95 MB before compaction.
+
 ## The way in
 
 The title's loops stay. A structure of the host's is made for each of the
@@ -54,13 +84,13 @@ each with its loads, to a query and a few triangle tests.
 
 Open, in the order they decide whether this works:
 
-1. Where a bottom-level structure's leaves are and how many triangles each
-   holds, from the header (`fork-ray-tracing.md`: dword 13 the elements'
-   offset, 3 their number), checked against a dump of the arenas.
+1. (Settled, above: the leaves are one stretch, a triangle each.)
 2. The structures are whole only on the card (shipped packed, unpacked there
-   by the builder; dynamic ones built there): the vertices must be gathered
-   by a pass on the card after the builder's, then the host's structure
-   built or refitted from them.
+   by the builder; dynamic ones built there): the host's structure is built
+   on the card after the builder's stages, from the arena or the title
+   buffer the leaves are in; the header (element count and offset) must be
+   known to the CPU, read back once a structure is unpacked. When to build
+   again: a dynamic structure the builder refits every frame.
 3. A ray query in translated DXIL (the emitter has none; test shaders come
    from the SDK's dxc), with the structure picked by the title structure's
    address.
