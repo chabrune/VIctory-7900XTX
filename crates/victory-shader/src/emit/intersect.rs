@@ -191,7 +191,14 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        let boxes = match at {
+            // (Not with the tests' stand-in for title memory, which has no
+            // directory for the roots' table to follow.)
+            NodeAt::Memory { low, high, .. } if crate::emit::ray_queries() && !Self::test_memory() => {
+                self.bvh_root(at, kind, &ray, sort, low, high)
+            }
+            _ => self.bvh_boxes(at, kind, &ray, sort),
+        };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
@@ -328,6 +335,119 @@ impl<'a> Lower<'a> {
         let a = self.s.m.bin(c, Bin::Add, base, p);
         self.s.flags |= flags::INT64;
         self.split64(a)
+    }
+
+    /// Whether the tests' stand-in for title memory is in place.
+    fn test_memory() -> bool {
+        #[cfg(test)]
+        {
+            TEST_MEMORY.get().is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// The box test of a node in title memory at `low`/`high` that may be
+    /// the root of a bottom-level structure the host has a structure of its
+    /// own for (`shader::RT_ROOTS`): then the card is asked for the ray's
+    /// nearest triangle in it, and the answer is the box node's whose one
+    /// child the ray enters is that triangle's node (none on a miss): the
+    /// program tests the triangle itself next and walks no box node of the
+    /// structure. Any other node is tested as ever ([`Lower::bvh_boxes`]).
+    /// Starts in the current block and leaves `self.cur` at the block it
+    /// ends in.
+    fn bvh_root(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool, low: V, high: V) -> [V; 4] {
+        use crate::emit::shader::{RT_FIRST_SLOT, RT_ROOT_THERE, RT_ROOTS, RT_ROOTS_AT, SLOT_MEMORY, USER_MEMORY_BASE};
+        use crate::native::RootType;
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        // The node's address in 64-byte units.
+        let (k6, k26, k255) = (k(self, 6), k(self, 26), k(self, 0xFF));
+        let high = self.s.m.bin(c, Bin::And, high, k255);
+        let key = self.s.m.bin(c, Bin::LShr, low, k6);
+        let above = self.s.m.bin(c, Bin::Shl, high, k26);
+        let key = self.s.m.bin(c, Bin::Or, key, above);
+        let top = self.s.m.bin(c, Bin::LShr, high, k6);
+        let there = k(self, RT_ROOT_THERE);
+        let top = self.s.m.bin(c, Bin::Or, top, there);
+        // Its entry in the table behind the directory.
+        let (golden, shift, k4, first) = (k(self, 0x9E37_79B1), k(self, 32 - RT_ROOTS.trailing_zeros()), k(self, 4), k(self, RT_ROOTS_AT));
+        let entry = self.s.m.bin(c, Bin::Mul, key, golden);
+        let entry = self.s.m.bin(c, Bin::LShr, entry, shift);
+        let entry = self.s.m.bin(c, Bin::Shl, entry, k4);
+        let entry = self.s.m.bin(c, Bin::Add, entry, first);
+        let directory = self.s.root_srv_handle(SLOT_MEMORY);
+        let (undef, all, align) = (self.s.m.undef(i32t), self.s.m.i8(15), k(self, 4));
+        let read = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[directory, entry, undef, all, align]);
+        let words: Vec<V> = (0..4)
+            .map(|n| {
+                let f = self.s.m.extract(c, read, n);
+                self.as_int(f)
+            })
+            .collect();
+        let same = self.s.m.cmp(c, pred::EQ, words[0], key);
+        let same_top = self.s.m.cmp(c, pred::EQ, words[1], top);
+        let root = self.s.m.bin(c, Bin::And, same, same_top);
+        let (asked, walked, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::CondBr(root, asked, walked));
+        // The card's structure: one query to the nearest triangle.
+        self.cur = asked;
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let run = k(self, RT_FIRST_SLOT);
+        let slot = self.s.m.bin(asked, Bin::Add, base, run);
+        let slot = self.s.m.bin(asked, Bin::Add, slot, words[2]);
+        // (An acceleration structure: resource kind 16.)
+        let structure = self.s.heap_handle(asked, slot, false, true, (16, 0));
+        self.s.flags |= flags::RAY_QUERIES;
+        let (void, i1t) = (self.s.t.void, self.s.t.i1);
+        // (Every triangle counts: the program's own test decides.)
+        let opaque = k(self, 1);
+        let query = self.s.op(asked, "allocateRayQuery", Attr::NoUnwind, i32t, 178, &[opaque]);
+        let (none, every, zero) = (k(self, 0), k(self, 0xFF), self.s.m.f32(0));
+        self.s.op(
+            asked,
+            "rayQuery_TraceRayInline",
+            Attr::NoUnwind,
+            void,
+            179,
+            &[
+                query,
+                structure,
+                none,
+                every,
+                ray.origin[0],
+                ray.origin[1],
+                ray.origin[2],
+                zero,
+                ray.direction[0],
+                ray.direction[1],
+                ray.direction[2],
+                ray.extent,
+            ],
+        );
+        self.s.op(asked, "rayQuery_Proceed.i1", Attr::NoUnwind, i1t, 180, &[query]);
+        let status = self.s.op(asked, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 184, &[query]);
+        let primitive = self.s.op(asked, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 210, &[query]);
+        let (one, k3, miss) = (k(self, 1), k(self, 3), k(self, bvh::NONE));
+        let hit = self.s.m.cmp(asked, pred::EQ, status, one);
+        // The triangle's node, as a pointer of kind 0.
+        let node = self.s.m.bin(asked, Bin::Add, words[3], primitive);
+        let pointer = self.s.m.bin(asked, Bin::Shl, node, k3);
+        let found = self.s.m.select(asked, hit, pointer, miss);
+        self.s.m.terminate(asked, Term::Br(join));
+        self.cur = walked;
+        let boxes = self.bvh_boxes(at, kind, ray, sort);
+        let walked_end = self.cur;
+        self.s.m.terminate(walked_end, Term::Br(join));
+        self.cur = join;
+        std::array::from_fn(|n| {
+            let phi = self.s.m.phi(join, i32t);
+            self.s.m.set_phi(phi, vec![(if n == 0 { found } else { miss }, asked), (boxes[n], walked_end)]);
+            phi
+        })
     }
 
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the

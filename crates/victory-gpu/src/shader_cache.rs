@@ -140,6 +140,10 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // The card's own ray tracing at structures' roots: as above.
+        if victory_shader::emit::ray_queries() {
+            bytes.extend_from_slice(b"VICTORY_RT_QUERY=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

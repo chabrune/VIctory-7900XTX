@@ -70,6 +70,33 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address
 /// (a title buffer the structure builder has not been given to write).
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
+/// The card's own ray tracing behind the title's traversal
+/// ([`super::ray_queries`]). The [`SLOT_MEMORY`] directory is followed, from
+/// byte [`RT_ROOTS_AT`], by a table of [`RT_ROOTS`] entries of four dwords
+/// for the roots of bottom-level structures the host has a structure of its
+/// own for: the root node's title address in 64-byte units (its low 32
+/// bits, then the bits above with [`RT_ROOT_THERE`]), the number of the
+/// host's structure, and the node number (64-byte units from the title
+/// structure's start) of the structure's first triangle. A root is at the
+/// entry [`rt_root_entry`] of its address's low dword, or not in the table.
+/// The host's structure `n` is the acceleration structure view at view-heap
+/// slot `base + RT_FIRST_SLOT + n` (`base` as for the memory copies); its
+/// primitive `i` is the title structure's triangle node `first + i`.
+pub const RT_ROOTS: u32 = 1 << 14;
+/// See [`RT_ROOTS`].
+pub const RT_ROOTS_AT: u32 = MEMORY_PAGES * 8;
+/// See [`RT_ROOTS`].
+pub const RT_ROOT_THERE: u32 = 1 << 31;
+/// See [`RT_ROOTS`]: past the slots of the memory copies' views.
+pub const RT_FIRST_SLOT: u32 = 1 << 12;
+/// The host's structures that can be numbered.
+pub const RT_STRUCTURES: u32 = 1 << 12;
+/// The entry of [`RT_ROOTS`] for a root whose address in 64-byte units has
+/// the low dword `key`.
+pub const fn rt_root_entry(key: u32) -> u32 {
+    key.wrapping_mul(0x9E37_79B1) >> (32 - RT_ROOTS.trailing_zeros())
+}
+
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
 /// `RootType::Other` code of a user-data dword the host computes: the view
@@ -119,6 +146,8 @@ pub(crate) mod flags {
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
+    /// Inline ray queries.
+    pub const RAY_QUERIES: u64 = 1 << 25;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
 
@@ -952,6 +981,10 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_TYPED64 != 0 {
             features |= 0x40_0000;
+        }
+        // (D3D_SHADER_FEATURE_RAYTRACING_TIER_1_1.)
+        if self.flags & flags::RAY_QUERIES != 0 {
+            features |= 0x10_0000;
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
