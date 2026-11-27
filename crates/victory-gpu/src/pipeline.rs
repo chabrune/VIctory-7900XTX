@@ -384,6 +384,20 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// At a dispatch of a builder pipeline, when the builder runs: whether its
+/// stages are left out in this frame (`VICTORY_BVH_BUILD_EVERY=<n>`, 2 to 4:
+/// they run in one frame of `n`, all of them or none; off unless given).
+/// The structures of what moves are then as old as that, and what the
+/// title asks of a structure it had built in a frame that was left out is
+/// not there: a measuring switch until the title is seen to stand it
+/// (`VICTORY_AB=<s>,VICTORY_BVH_BUILD_RESTS` by turns).
+#[cfg(windows)]
+pub(crate) fn builder_skips() -> bool {
+    static N: OnceLock<u64> = OnceLock::new();
+    let n = *N.get_or_init(|| std::env::var("VICTORY_BVH_BUILD_EVERY").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| (2..=4).contains(n)).unwrap_or(1));
+    n > 1 && crate::frame::current() % n != 0 && crate::toggled!("VICTORY_BVH_BUILD_RESTS")
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]

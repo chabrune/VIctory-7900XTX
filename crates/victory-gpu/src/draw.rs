@@ -3061,7 +3061,7 @@ impl State {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::is_builder(self.pipeline as This) && (!crate::pipeline::builder_runs() || crate::pipeline::builder_skips()) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -4249,7 +4249,7 @@ impl State {
         if crate::pipeline::rests(self.pipeline as This) {
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::is_builder(self.pipeline as This) && (!crate::pipeline::builder_runs() || crate::pipeline::builder_skips()) {
             return false;
         }
         const DRAW: u32 = 0;

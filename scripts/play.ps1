@@ -199,6 +199,13 @@ if ($Console -eq 'series-s') {
     # 29.8, 30.0 and 30.2 (run c1); the card stands idle 2.3 ms a frame against 3.0. No error in
     # four runs, the picture the same. -More @{VICTORY_SUBMIT_AFTER='0'}: as before.
     $settings.VICTORY_SUBMIT_AFTER = '1'
+    # A view of light (R9G9B9E5) the title places in the memory of a texture its shaders write
+    # as words (R32_UINT) is a view of that texture, made castable (relaxed format casting,
+    # where the card has it), instead of a texture of its own that every use copied into: 59
+    # copies a frame gone, 30.5-30.7 ms a frame against 31.2-31.6 in the first played scene
+    # (runs ab-on and ab-off, RX 7700 XT, -RayTracingLow, 2026-11-27), the picture the same in
+    # the same shot. -More @{VICTORY_ALIAS_CAST='0'}: copied, as before.
+    $settings.VICTORY_ALIAS_CAST = '1'
     # The title's menus are black on this profile and its start screen waits for Enter (A).
     # The harness presses it for us, in every build (crates/victory-hle/src/modules/
     # gameinput.rs, `scripted`): one press every four seconds from 6 to 62 s, a single press
