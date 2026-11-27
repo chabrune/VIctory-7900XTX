@@ -1430,13 +1430,17 @@ fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8
     crate::texstore::find(r.desc.shape(), level, &smaller).map(|bytes| (level, bytes))
 }
 
+#[cfg(windows)]
+pub(crate) fn mapped_mips_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MAPPED_MIPS").is_some_and(|v| v == "1"))
+}
+
 /// With VICTORY_TEXTURE_MAPPED_MIPS=1, prefer a contiguous chain whose
-/// console pages are already mapped. Keep the requested base if no chain
-/// is readable yet; the existing upload path handles that case.
+/// console pages are already mapped. Return None when no chain is readable.
 #[cfg(windows)]
 fn mapped_base(r: &Resource, requested: u32) -> Option<u32> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MAPPED_MIPS").is_some_and(|v| v == "1")) {
+    if !mapped_mips_enabled() {
         return Some(requested);
     }
     let Some(t) = texture_layout(&r.desc).filter(|t| t.planes.len() == 1) else {
@@ -1482,6 +1486,14 @@ pub(crate) fn want_level(this: This, first: u32) {
         crate::texlate::viewed(this as usize, first);
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    // Keep the finest requested mip even while its pages are absent.
+    // A later refresh through a coarser view can then grow this same copy
+    // once the finer pages arrive.
+    let first = if mapped_mips_enabled() {
+        first.min(r.host.wanted.fetch_min(first, Relaxed))
+    } else {
+        first
+    };
     let Some((host, _)) = made.as_ref() else {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
