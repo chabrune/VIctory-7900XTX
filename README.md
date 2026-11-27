@@ -146,6 +146,11 @@ It keeps the choices in
 `%LOCALAPPDATA%\victory-7900xtx\start.json` (outside the repository) and
 `scripts\start.ps1 -Last` starts again with them.
 
+After a translator update, `scripts\play.ps1 -Exe <path> -Console series-s -WarmShaders`
+fills the translation cache without starting the title. Pass the same profile
+options and `-More` settings you use to play so the cache keys match. Add `-Warm`
+to also prepare the previously used driver pipelines, after shader translation.
+
 **`Lancer VIctory.cmd`** (double-click it, at the root of the repository) opens
 the same choices as a window (`scripts\lanceur.ps1`, in French): a preset on
 top (the fastest measured with ray tracing by default: the Series S profile,

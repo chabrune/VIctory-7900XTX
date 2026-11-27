@@ -17,6 +17,22 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+/// Keep the stage/hash labels used for shader replacement, and append
+/// program names for the capture's per-pipeline timing report.
+fn capture_name(shaders: &[Arc<Shader>]) -> String {
+    let mut label = format!("{shaders:?}");
+    for shader in shaders {
+        if let Some(name) = victory_shader::dxbc::Container::parse(&shader.container)
+            .ok()
+            .and_then(|container| container.program_name())
+        {
+            label.push(' ');
+            label.push_str(name);
+        }
+    }
+    label
+}
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -639,7 +655,7 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&pso, || capture_name(shaders));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -692,7 +708,7 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&pso, || capture_name(shaders));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -798,7 +814,7 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, "host pipeline");
-        crate::host::name(&pso, || format!("{shaders:?}"));
+        crate::host::name(&pso, || capture_name(shaders));
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,

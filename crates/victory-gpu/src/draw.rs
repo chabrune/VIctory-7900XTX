@@ -4201,6 +4201,7 @@ impl State {
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
         kind: u32,
+        counter: Option<&(std::sync::Arc<crate::shadow::Shadow>, u64)>,
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
@@ -4213,16 +4214,22 @@ impl State {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
+        let count = counter.map(|(s, at)| (s.id(), s.offset(*at)));
         if let Some(b) = &mut self.batch
-            && let Some(at) = b.table.place(id, offset, kind)
+            && let Some(at) = b.table.place_counted(id, offset, kind, count)
         {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        let mut sources = argument_copies(args);
+        if let Some((s, _)) = counter {
+            sources.retain(|(id, _)| *id != s.id());
+            sources.insert(0, (s.id(), s.buffer.clone()));
+        }
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &sources)?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let at = table.place(id, offset, kind)?;
+        let at = table.place_counted(id, offset, kind, count)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
     }
@@ -4340,13 +4347,19 @@ impl State {
             }
             self.window = None;
         }
-        // One record without a count: clamped in a batch (`batches`).
-        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
+        // A counted single record can share the ordered batch when enabled.
+        static COUNT_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let count_batch = ordered && *COUNT_BATCH.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_BATCH_COUNT").is_some_and(|v| v == "1"));
+        let batch = if !alone && batches() > 0 && max == 1 && (count.is_none() || count_batch) {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            if let Some((s, at)) = &counter {
+                s.refresh(list, *at, 4);
+            }
+            self.batched(list, &args, arguments, kind, counter.as_ref())
         } else {
             None
         };
+        let snap_count = batch.is_some() && counter.is_some();
         if batch.is_some() {
             self.window = None;
         }
@@ -4461,8 +4474,8 @@ impl State {
                 max,
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                if snap_count { Some(&bounded) } else { counter.as_ref().map(|(s, _)| &s.buffer) },
+                if snap_count { at + u64::from(crate::indirect::batch::COUNT_OFFSET) } else { counter.as_ref().map_or(0, |(s, at)| s.offset(*at)) },
             )
         };
         if kind == MESH {

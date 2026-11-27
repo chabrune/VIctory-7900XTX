@@ -23,6 +23,8 @@ pub(crate) const JOBS: u32 = 256;
 pub(crate) const TABLE: u64 = 16 + 16 * JOBS as u64;
 /// The bytes of a clamped record's place in the scratch buffer.
 pub(crate) const SLOT: u32 = 32;
+/// Byte offset of the snapshotted count within its argument slot.
+pub(crate) const COUNT_OFFSET: u32 = 24;
 /// The source buffers a pass can read.
 pub(crate) const SOURCES: usize = 4;
 /// The most executions charged by one job: the most a record costs (2^26)
@@ -37,7 +39,8 @@ ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
 // The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
 // (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// record's offset in the source; its place in scratch; counter offset.
+// Bit 12 enables a counter, with its source in bits 2-3.
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
@@ -71,6 +74,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // As the clamp of one execution (`super::SOURCE`) bounds them.
     if (active) {
         job = jobs.Load4(16 + id.x * 16);
+        if ((job.x & 4096u) != 0) {
+            active = load((job.x >> 2) & 3, job.w) != 0;
+            dst_args.Store(job.z + 24, active ? 1 : 0);
+        }
+    }
+    if (active) {
         kind = (job.x >> 4) & 15;
         words = min((job.x >> 8) & 15, 5);
         for (uint w = 0; w < words; w++) {
@@ -203,7 +212,7 @@ pub(crate) struct Table {
     /// How many executions each job is charged for so far.
     times: Vec<u32>,
     /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    known: std::collections::HashMap<(u32, u32, u32, Option<(u32, u32)>), u32>,
 }
 
 impl Table {
@@ -224,10 +233,22 @@ impl Table {
     /// there is none. `None` if the pass cannot read that copy or has no
     /// room for another job.
     pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+        self.place_counted(id, offset, kind, None)
+    }
+
+    pub(crate) fn place_counted(&mut self, id: u64, offset: u64, kind: u32, count: Option<(u64, u64)>) -> Option<u64> {
         let source = self.sources.iter().position(|&s| s == id)? as u32;
+        let count = match count {
+            Some((id, at)) => Some((
+                self.sources.iter().position(|&s| s == id)? as u32,
+                u32::try_from(at).ok().filter(|at| at.is_multiple_of(4) && at.checked_add(4).is_some())?,
+            )),
+            None => None,
+        };
+        let flags = count.map_or(0, |(slot, _)| (1 << 12) | (slot << 2));
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
-        let key = (source, offset, kind);
+        let key = (source, offset, kind, count);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
         if let Some(&i) = self.known.get(&key)
@@ -235,7 +256,7 @@ impl Table {
         {
             self.times[i as usize] += 1;
             // SAFETY: the job's own word of the table ([`Table::new`]).
-            unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, self.times[i as usize])) };
+            unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, self.times[i as usize]) | flags) };
             return Some(place(i));
         }
         let i = self.times.len() as u32;
@@ -247,14 +268,30 @@ impl Table {
         // SAFETY: inside the table: fewer than [`JOBS`] jobs before it.
         unsafe {
             let to = table.add(4 + 4 * i as usize);
-            to.write_volatile(job(source, kind, 1));
+            to.write_volatile(job(source, kind, 1) | flags);
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
-            to.add(3).write_volatile(0);
+            to.add(3).write_volatile(count.map_or(0, |(_, offset)| offset));
             table.write_volatile(i + 1);
         }
         Some(place(i))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn counted_jobs_only_share_slots_with_the_same_counter() {
+    let mut words = vec![0u32; TABLE as usize / 4];
+    // SAFETY: the allocation is aligned and lives longer than the table.
+    let mut table = unsafe { Table::new(words.as_mut_ptr().cast(), 0, [1, 2, 0, 0]) };
+    assert_eq!(table.place_counted(1, 0, 2, Some((2, 8))), Some(0));
+    assert_eq!(table.place_counted(1, 0, 2, Some((2, 8))), Some(0));
+    assert_eq!(table.place_counted(1, 0, 2, Some((2, 12))), Some(u64::from(SLOT)));
+    assert_eq!(table.place_counted(1, 0, 2, Some((3, 8))), None);
+    assert_eq!(words[0], 2);
+    assert_eq!(words[4], job(0, 2, 2) | (1 << 12) | (1 << 2));
+    assert_eq!(words[7], 8);
+    assert_eq!(words[11], 12);
 }
 
 /// Records the pass over the table at `jobs` (a host address) into `dst`,

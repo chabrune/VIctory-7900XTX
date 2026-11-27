@@ -18,6 +18,28 @@ Off unless `VICTORY_RECORD` is set. Build with
 | `VICTORY_RECORD_FRAMES=<n>` | frames to capture (1) |
 | `VICTORY_RECORD_ALWAYS=1` | record lists from the start: needed only if notes say lists were not recorded (a title that submits old lists again) |
 
+For the dormitory, leave `VICTORY_RECORD_AT` unset, set
+`VICTORY_RECORD_ALWAYS=1` and place `go` in the capture directory once the
+camera is in position. Record a separate run without the capture switches
+for live timings. The recorder drains the queues and its timings include
+that work. Keep the camera path, save, profile and shader cache state the
+same across comparisons. Compare frame median and p95, GPU working time,
+submission preparation, system memory and VRAM budget. For texture
+streaming, compare the counts and latency buckets on the `texlate` line
+over the same camera path.
+
+For Series S, compare the indirect ordering path with
+`VICTORY_PORT_CONSTANTS_ORDER=1` and `VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`,
+then with `VICTORY_PORT_CONSTANTS_ORDER_ALONE=0` to allow the existing batch
+path for eligible single records. Compare the picture as well as the timings.
+With that grouped setting, add `VICTORY_INDIRECT_BATCH_COUNT=1` to include
+ordered executions with a count buffer and a maximum of one record. The
+batch snapshots the counter along with its arguments. Larger executions
+still use the standalone clamp.
+For texture experiments, vary `VICTORY_TEXTURE_MAPPED_MIPS=1` and
+`VICTORY_TEXTURE_POOL_CLASSES=1` independently. The former prefers a smaller
+mapped mip chain and the latter prefers to place small aligned textures together.
+
 At the time given, lists are recorded for a few frames, until a frame's lists
 were all recorded; the next frame is captured: everything sent to the drawing
 queue between two presents (the first may be the swap chain's own work for
@@ -48,11 +70,18 @@ without waiting between submissions. Reported, from timestamps on the card:
 the frame (first list's start to last list's end), each submission, copies
 that stand for what the CPU wrote between submissions (not the title's cost),
 and gaps. With `--timing detailed`, each command: sums by kind and the
-costliest pipelines with the names the runtime logs and their DXIL hashes
+costliest pipelines with the names the runtime logs, shader program names
+where available in new captures, and their DXIL hashes
 (blake3). A command's time is from the end of the one before to its own end:
 draws overlap, so it is a share of the list, not a cost alone; the extra
 timestamps cost a little too. The picture goes to `replay.png` and is compared
 with the presented one.
+
+If a placed resource cannot be recreated, read the first resource error
+before analyzing timings. It reports the recorded offset, the recreated heap,
+and the allocation size and alignment returned for the replay description.
+A range that fits can still be rejected for other reasons. Use `--debug-layer`
+to include the device's validation messages in that case.
 
 | switch | does |
 |---|---|

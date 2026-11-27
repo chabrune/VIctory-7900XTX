@@ -627,16 +627,18 @@ impl Memory {
         // (The instances are the title's own, in its order: the card's
         // nearest hit names the title's instance by its number.)
         for (n, &(i, number)) in built.iter().enumerate() {
-            let Some(structure) = self.rt.structures[number as usize].1.clone() else { continue };
+            let Some(structure) = self.rt.structures[number as usize].1.as_ref() else { return };
             let matrix = self.rt.scenes[at].instances[i as usize].1;
             let mut desc = D3D12_RAYTRACING_INSTANCE_DESC::default();
             desc.Transform.copy_from_slice(&matrix);
-            // (InstanceID: the title's own instance number; 24 bits.)
-            desc._bitfield1 = i & 0xFF_FFFF;
+            // Use the same nonzero visibility mask as the per-instance
+            // path. The low 24 bits contain the title's instance number.
+            desc._bitfield1 = (i & 0xFF_FFFF) | (0xFF << 24);
             // SAFETY: a structure of ours, alive.
             desc.AccelerationStructure = unsafe { structure.GetGPUVirtualAddress() };
             // SAFETY: the upload buffer holds `built.len()` descriptions.
             unsafe { data.cast::<D3D12_RAYTRACING_INSTANCE_DESC>().add(n).write_unaligned(desc) };
+            list.keep(structure);
         }
         let top = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
@@ -673,6 +675,7 @@ impl Memory {
         }
         list.keep(&instances);
         list.keep(&scratch);
+        list.keep(&tlas);
         let number = match self.rt.scenes[at].number {
             Some(number) => number,
             None => {

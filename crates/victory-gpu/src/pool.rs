@@ -185,6 +185,8 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// Preferred allocation class while this block still contains pieces.
+    small_textures: Option<bool>,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -227,6 +229,18 @@ impl<B: Clone> Pool<B> {
         align: u64,
         now: u64,
         ripe: Ripe,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_class(len, align, now, ripe, None, make)
+    }
+
+    fn take_class(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+        small: Option<bool>,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -239,6 +253,7 @@ impl<B: Clone> Pool<B> {
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
                 && ripe.is(block)
+                && (small.is_none() || block.small_textures == small || block.free.whole(BLOCK))
                 && let Some(start) = block.free.take(len, align)
             {
                 found = Some((i, start));
@@ -247,10 +262,21 @@ impl<B: Clone> Pool<B> {
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            let mut unripe: Vec<(u64, usize)> = self.blocks.iter().enumerate().filter_map(|(i, b)| {
+                let block = b.as_ref()?;
+                (small.is_none() || block.small_textures == small || block.free.whole(BLOCK))
+                    .then_some((block.made, i))
+            }).collect();
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+        }
+        // Use a compatible reserve before mixing classes. If all reserves
+        // are occupied, reuse existing space before asking for another heap.
+        if found.is_none() && small.is_some() {
+            found = self.blocks.iter_mut().enumerate().find_map(|(i, block)| {
+                let block = block.as_mut().filter(|block| ripe.is(block))?;
+                Some((i, block.free.take(len, align)?))
+            });
         }
         let (i, start) = match found {
             Some(found) => found,
@@ -275,6 +301,10 @@ impl<B: Clone> Pool<B> {
             }
         }
         let block = self.blocks[i].as_mut()?;
+        let was_empty = start == 0 && (len == BLOCK || block.free.0.get(&len) == Some(&(BLOCK - len)));
+        if block.small_textures.is_none() || was_empty {
+            block.small_textures = small;
+        }
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -302,7 +332,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), small_textures: None, used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -858,6 +888,13 @@ fn cut_buffer(device: &ID3D12Device, size: u64) -> Option<(ID3D12Resource, bool)
     }
 }
 
+/// Prefer separate blocks for small 4 KiB-aligned textures when enabled.
+fn texture_class(info: &D3D12_RESOURCE_ALLOCATION_INFO) -> Option<bool> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL_CLASSES").is_some_and(|v| v == "1"))
+        .then_some(info.Alignment == 4096 && info.SizeInBytes <= 65536)
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -887,7 +924,7 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_class(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), texture_class(&info), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -949,6 +986,21 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_classes_use_available_reserves_before_mixing() {
+        let mut pool = Pool::new(2);
+        pool.add(1, 0);
+        pool.add(2, 1);
+        let ripe = Ripe { started: 1, finished: 0, ahead: 1 };
+        let take = |pool: &mut Pool<u32>, small| {
+            pool.take_class(65536, 4096, 0, ripe, Some(small), || None).unwrap().1
+        };
+        assert_eq!(take(&mut pool, false), 1);
+        assert_eq!(take(&mut pool, true), 2);
+        assert_eq!(take(&mut pool, false), 1);
+        assert_eq!(take(&mut pool, true), 2);
+    }
 
     #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {

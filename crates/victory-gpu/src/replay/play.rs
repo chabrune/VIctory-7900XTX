@@ -847,7 +847,6 @@ impl Player {
                 .with_context(|| format!("heap {}", h.id))?;
             self._heaps.extend(heap.map(|heap| (h.id, heap)));
         }
-        let mut failed = 0;
         let mut moves: BTreeMap<String, (u32, u64)> = BTreeMap::new();
         for (index, r) in self.frame.resources.iter().enumerate() {
             let is_buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
@@ -934,19 +933,33 @@ impl Player {
                         },
                     );
                 }
-                (e, _) => {
-                    if failed == 0 {
-                        tracing::warn!("resource {} not made: {e:?}: {r:?}", r.id);
-                    }
-                    failed += 1;
+                (result, _) => {
+                    let placement = match &r.place {
+                        Place::Placed { heap, offset } => match self._heaps.get(heap) {
+                            Some(heap) => {
+                                // SAFETY: the live heap and the same resource description
+                                // that was passed to CreatePlacedResource.
+                                let (heap, allocation) = unsafe {
+                                    (heap.GetDesc(), self.device.GetResourceAllocationInfo(0, &[desc]))
+                                };
+                                let issue = placement_issue(
+                                    *offset, heap.SizeInBytes, allocation.SizeInBytes, allocation.Alignment,
+                                );
+                                format!("offset {offset:#x}; heap {heap:?}; allocation {allocation:?}; {issue}")
+                            }
+                            None => format!("heap {heap} is missing from the replay"),
+                        },
+                        _ => format!("{:?}", r.place),
+                    };
+                    bail!(
+                        "resource {} could not be recreated: {result:?}; recorded {r:?}; replay description {desc:?}; replay placement {placement}",
+                        r.id
+                    );
                 }
             }
             if !is_buffer {
                 self.start.insert(r.id, r.state.clone());
             }
-        }
-        if failed > 0 {
-            self.note(format!("{failed} resources could not be made again"));
         }
         if buffers != Buffers::AsRecorded {
             self.notes.push(format!(
@@ -3502,6 +3515,28 @@ impl Player {
             .find(|r| r.name == name)
             .map(|r| r.id)
     }
+}
+
+fn placement_issue(offset: u64, heap_bytes: u64, bytes: u64, alignment: u64) -> &'static str {
+    if bytes == u64::MAX || alignment == 0 {
+        "the device rejected the allocation description"
+    } else if !offset.is_multiple_of(alignment) {
+        "the captured offset does not meet the replay alignment"
+    } else if offset.checked_add(bytes).is_none_or(|end| end > heap_bytes) {
+        "the replay allocation extends past the heap"
+    } else {
+        "the allocation fits the heap and meets its replay alignment"
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn replay_placement_diagnoses_allocation_failures() {
+    assert!(placement_issue(0, 65536, u64::MAX, 0).contains("rejected"));
+    assert!(placement_issue(4096, 131072, 65536, 65536).contains("does not meet"));
+    assert!(placement_issue(65536, 65536, 65536, 65536).contains("past the heap"));
+    assert!(placement_issue(u64::MAX, u64::MAX, 1, 1).contains("past the heap"));
+    assert!(placement_issue(65536, 131072, 65536, 65536).contains("fits"));
 }
 
 /// Everything to send for a frame.

@@ -1430,6 +1430,34 @@ fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8
     crate::texstore::find(r.desc.shape(), level, &smaller).map(|bytes| (level, bytes))
 }
 
+/// With VICTORY_TEXTURE_MAPPED_MIPS=1, prefer a contiguous chain whose
+/// console pages are already mapped. Keep the requested base if no chain
+/// is readable yet; the existing upload path handles that case.
+#[cfg(windows)]
+fn mapped_base(r: &Resource, requested: u32) -> Option<u32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MAPPED_MIPS").is_some_and(|v| v == "1")) {
+        return Some(requested);
+    }
+    let Some(t) = texture_layout(&r.desc).filter(|t| t.planes.len() == 1) else {
+        return Some(requested);
+    };
+    let layout = &t.planes[0].layout;
+    if layout.slices != 1 || layout.desc.swizzle.xor() || layout.mips.is_empty() {
+        return Some(requested);
+    }
+    let data = r.data().cast_const();
+    let last = layout.first_tail_mip.min(layout.mips.len() as u32 - 1);
+    let block = u64::from(layout.desc.block.max(1));
+    (requested..=last.max(requested)).find(|&level| {
+            let bytes = layout.bytes_from(level);
+            (r.desc.width >> level).is_multiple_of(block)
+                && (u64::from(r.desc.height) >> level).is_multiple_of(block)
+                && bytes != 0
+                && crate::texture::committed(data, bytes as usize)
+        })
+}
+
 /// Since the start: host copies made with a first level other than the
 /// title's, and their bytes; host copies replaced by one with more levels;
 /// bytes of title memory such copies' textures take whole.
@@ -1458,7 +1486,7 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    if host.base == 0 || mapped_base(r, base_level(&r.desc, first)).is_none_or(|base| host.base <= base) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1687,12 +1715,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            let requested = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            base = mapped_base(r, requested).unwrap_or(requested);
             // The store has its larger levels: made whole at once.
             if over_cap(&r.desc) == 0
                 && base > 0
                 && tiled.is_none()
-                && let Some(found) = stored_levels(r, first)
+                && let Some(found) = stored_levels(r, if first == u32::MAX { base } else { first.max(base) })
             {
                 base = 0;
                 prefill = Some(found);

@@ -1624,6 +1624,13 @@ struct Workers {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    // (In one run both ways, `VICTORY_AB=<s>,VICTORY_WIDE_SPIN`: 200 us where no number is given.)
+    #[cfg(feature = "diagnostics")]
+    let most = match crate::ab::pick("VICTORY_WIDE_SPIN") {
+        Some(true) => if most == 0 { 200 } else { most },
+        Some(false) => 0,
+        None => most,
+    };
     if most == 0 {
         return;
     }
