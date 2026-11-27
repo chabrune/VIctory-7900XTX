@@ -19,6 +19,103 @@ Both runs: the user's save inside the house (interior, the character standing), 
 serializes the card (5-10 frames a second), so these are the card's own milliseconds
 per command, not shares of a played frame; a played frame here takes 35-38 ms.
 
+## A replayed frame is the measure; the timing run's single commands are not
+
+The timing run's heavy single commands do not stand. The frame of the open world the
+main checkout's session recorded (no ray tracing; its `recw/capture-1`), replayed with
+`victory replay <capture> --timing detailed --top 4000` (runs rp1 to rp3: 23.4-24.6 ms
+on the card, median of 5; 23.7 with list timing only), gives
+`PS_CompositeIndirectDrawBlend` 0.01 ms where the timing run gave 2.4,
+`CS_GatherRaymarchedLocalLightsClassified16` 0.26 for 1.05 and the probes' temporal
+resolve 0.22 for 0.7. Only `CS_ScreenProbes_ActivateRays` is heavy both ways (1.76 ms
+for 2.7). The timing run waits for the card at each command, and a command that is
+the first to need what earlier ones left pending is charged their time; its sums by
+kind of command are of the right order (30 ms against 24), its single rows are not to
+be believed without a replay. `replaymap.py` beside `passmap.py` sums a replay's
+report the same way:
+
+1393 pipelines, 16.35 ms in 5903 draws and dispatches
+
+| pass | families | commands | ms | share |
+|---|---:|---:|---:|---:|
+| ray tracing, probes, light cache | 110 | 1093 | 3.61 | 22.1 % |
+| geometry and materials, others | 461 | 1277 | 2.89 | 17.7 % |
+| the layer's own passes | 4 | 821 | 1.75 | 10.7 % |
+| shadows | 42 | 1356 | 1.75 | 10.7 % |
+| not named | 40 | 202 | 1.18 | 7.2 % |
+| post and picture | 24 | 48 | 1.14 | 7.0 % |
+| depth, velocity, masks | 39 | 377 | 1.08 | 6.6 % |
+| lighting (deferred) | 54 | 266 | 0.96 | 5.9 % |
+| sky, fog, water, wind, particles | 51 | 194 | 0.68 | 4.2 % |
+| culling, skinning, upkeep | 56 | 199 | 0.50 | 3.1 % |
+| hair | 13 | 51 | 0.42 | 2.6 % |
+| composite of the lit picture | 5 | 5 | 0.33 | 2.0 % |
+| mirror reflections | 3 | 14 | 0.06 | 0.4 % |
+
+| family | pass | pipelines | commands | ms |
+|---|---|---:|---:|---:|
+| CS_ScreenProbes_ActivateRays | ray tracing, probes, light cache | 1 | 1 | 1.76 |
+| victory: argument clamp | the layer's own passes | 1 | 157 | 0.76 |
+| CS_TAA2_Resolve | post and picture | 1 | 1 | 0.74 |
+| copies to (a texture, in a block) | the layer's own passes | 89 | 177 | 0.64 |
+| MS_VS_CascadeShadows_draw | shadows | 16 | 439 | 0.41 |
+| PS_draw_screen_space | geometry and materials, others | 1 | 75 | 0.38 |
+| PS_DeferredTextured | lighting (deferred) | 18 | 166 | 0.35 |
+| victory: card compare | the layer's own passes | 1 | 430 | 0.34 |
+| ? compute 82a2ad6d07417d36 |  | 1 | 1 | 0.33 |
+| PS_LinearDepth | depth, velocity, masks | 7 | 164 | 0.32 |
+| PS_CascadeShadows_texture | shadows | 39 | 332 | 0.30 |
+| PS_NoDir_PBR_MATERIAL_STANDARD | geometry and materials, others | 1 | 1 | 0.29 |
+| CS_GatherRaymarchedLocalLightsClassified16 | lighting (deferred) | 1 | 1 | 0.26 |
+| ? unnamed (DXIL 65c675622927212a) |  | 1 | 1 | 0.26 |
+| CS_BatchCullMeshlets_ParaboloidShadows | shadows | 1 | 19 | 0.25 |
+| CS_FinalGather_0_1_1_0 | ray tracing, probes, light cache | 1 | 1 | 0.24 |
+| PS_LinearDepthOpaque | depth, velocity, masks | 4 | 134 | 0.24 |
+| CS_GenerateShaderBinOffsets | ray tracing, probes, light cache | 1 | 7 | 0.22 |
+| CS_ScreenProbes_TemporalResolve_ReflectiveCaustics | ray tracing, probes, light cache | 1 | 1 | 0.22 |
+| VS_CascadeShadows_drawskinned | shadows | 3 | 16 | 0.21 |
+| PS_DeferredPedTexturedNC | lighting (deferred) | 8 | 37 | 0.18 |
+| CS_GenerateShadowMasks_Checkerboard_NoHair | hair | 1 | 1 | 0.18 |
+| MS_VS_CascadeShadows_drawskinned | shadows | 3 | 105 | 0.17 |
+| PS_Composite | composite of the lit picture | 1 | 1 | 0.16 |
+| CS_PosOnlyLodSkinning | culling, skinning, upkeep | 1 | 7 | 0.15 |
+| CS_Gather_Classified_1 | ray tracing, probes, light cache | 1 | 1 | 0.14 |
+| CS_SkyRadianceCache | ray tracing, probes, light cache | 1 | 1 | 0.13 |
+| CS_SkyRadianceCache_Camera_Gather | ray tracing, probes, light cache | 1 | 1 | 0.12 |
+| VS_CascadeShadows_drawskinnedTexture | shadows | 7 | 80 | 0.11 |
+| CS_ScreenProbes_RadianceSpatialFilter | ray tracing, probes, light cache | 1 | 1 | 0.10 |
+| ? unnamed (DXIL 844fc95a66e7f23c e1a7a6c8f |  | 1 | 1 | 0.10 |
+| CS_ComputeLuminanceBilateralGrid | post and picture | 1 | 1 | 0.10 |
+| MS_VS_CascadeShadows_drawTexture | shadows | 9 | 179 | 0.10 |
+| CS_GenerateMaterialMasks | depth, velocity, masks | 1 | 1 | 0.09 |
+| ? compute 8f9eb68d0c6dd5cf |  | 1 | 11 | 0.08 |
+| PS_Textured_Eight | geometry and materials, others | 1 | 6 | 0.08 |
+| PS_HairStrandVBuffer | hair | 1 | 13 | 0.08 |
+| CS_RayMiss | ray tracing, probes, light cache | 1 | 3 | 0.08 |
+| CS_ScreenSpaceBentConesCheckerboard | ray tracing, probes, light cache | 1 | 1 | 0.08 |
+| CS_InterpolateStrands | hair | 8 | 21 | 0.08 |
+
+ten heaviest families 6.03 ms; families under 0.05 ms each: 4.29 ms in 841 families
+
+What it says:
+
+- The card has 24 ms of work in this frame of the world, and the title plays it at
+  26-29 frames a second (35-38 ms): the card is not what holds the frame. What does is
+  the main checkout's question (the thread that prepares, and the card standing idle
+  between submissions).
+- One title pass is worth a look by itself: `CS_ScreenProbes_ActivateRays`, 1.76 ms
+  in one dispatch (the main checkout rests it 15 frames in 16 without ray tracing).
+  After it `CS_TAA2_Resolve`, 0.74 ms.
+- The layer's own passes are 1.75 ms of the 16.4 (argument clamps 0.76 in 157, copies
+  to textures 0.64, compares of card buffers 0.34 in 430), and the unordered-access
+  barriers 1.66 ms in 2,550 beside them: as much as any group of the title's passes
+  but the probes.
+- Nothing else is above 0.45 ms. 841 families are under 0.05 ms each and 4.3 ms
+  together: no pass to group or replace by name would give a millisecond.
+
+The two sections below are the timing runs as first read; keep them for the sums and
+for which families a scene uses, not for a single command's cost.
+
 ## Without ray tracing (run pm1): 30.3 ms a frame in 1,767 kinds of command
 
 | pass | families | commands a frame | ms a frame | share |
