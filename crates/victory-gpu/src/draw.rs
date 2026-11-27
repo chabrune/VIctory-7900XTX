@@ -3749,12 +3749,12 @@ impl State {
                 (table, n, h.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let reader = (std::ptr::from_ref(plan) as usize, slot, STORES.get(), TESTED_DEPTH.get().0);
+            let once = ready_once() && selected.is_empty() && !group.has_uav;
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && !group.has_uav;
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -3827,6 +3827,10 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let depth_before = TESTED_DEPTH.get();
+            if once {
+                TESTED_DEPTH.set((depth_before.0, false));
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3937,6 +3941,14 @@ impl State {
                             once!(slot, "a table entry without a view");
                         }
                     }
+                }
+            }
+            if once {
+                let read_depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || read_depth));
+                if let Some(known) = self.fresh_tables.get_mut(&key) {
+                    known.epoch = list.epoch();
+                    known.ready.push((reader, read_depth));
                 }
             }
             made.push((slot, first * 32));
@@ -4667,7 +4679,7 @@ struct FreshTable {
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
-    ready: Vec<((usize, usize, bool, usize), bool)>,
+    ready: Vec<((usize, u8, bool, usize), bool)>,
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
