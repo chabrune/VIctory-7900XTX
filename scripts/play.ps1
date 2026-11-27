@@ -190,6 +190,15 @@ if ($Console -eq 'series-s') {
     # ten seconds in one run (up-merge1, RX 7700 XT, -RayTracingLow, 2026-11-27).
     # -More @{VICTORY_PORT_CONSTANTS_ORDER='1'}: the ordering, as upstream has it by default.
     $settings.VICTORY_PORT_CONSTANTS_ORDER = '0'
+    # The end of a submission sent ahead (the wait for the heaps' records, the lists given to
+    # the queue, the fence behind them) is the sending thread's, and the thread that prepares
+    # goes on to the next submission meanwhile (crates/victory-gpu/src/host/sender.rs). RX 7700
+    # XT, -RayTracingLow at render scale 0.5, the first played scene, on and off by turns in one
+    # run: medians of 30.8, 30.7 and 29.8 ms a frame with it against 31.6, 31.1 and 30.3 (run a1,
+    # 2026-11-27), and after the merge of 953d92a8 29.8, 29.9, 29.6 and 30.2 against 30.8, 30.4,
+    # 29.8, 30.0 and 30.2 (run c1); the card stands idle 2.3 ms a frame against 3.0. No error in
+    # four runs, the picture the same. -More @{VICTORY_SUBMIT_AFTER='0'}: as before.
+    $settings.VICTORY_SUBMIT_AFTER = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
