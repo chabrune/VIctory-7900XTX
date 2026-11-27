@@ -224,7 +224,14 @@ impl Paged {
             }
             let tiles: u32 = runs.iter().map(|run| run.1).sum();
             if let Some(heap) = heap_at(index) {
-                map_runs(host.queue(), &buffer, first, tiles, &heap, &runs);
+                // (A buffer no list names yet: its tiles need no place in
+                // the order of what the sending thread still holds, and
+                // waiting for that thread here, under the lock of the
+                // copies' table, stood the title still at the world's
+                // start: the sending thread waited for the heaps' records,
+                // whose threads waited for that table. One run in five,
+                // 2026-11-27, with VICTORY_SUBMIT_AFTER=1.)
+                map_runs(&host.raw_queue, &buffer, first, tiles, &heap, &runs);
             }
             for &(start, count) in &runs {
                 own.extend((start..start + count).map(|tile| (index as u32, tile)));
