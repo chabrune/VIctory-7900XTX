@@ -172,6 +172,14 @@ if ($Console -eq 'series-s') {
     # 1.1 MiB of the PC's memory for good on an RX 7700 XT (about 1.6 GB; every run of
     # 2026-11-26 from rt-low1 on). -More @{VICTORY_PRELUDE_POOL='0'}: as before.
     $settings.VICTORY_PRELUDE_POOL = '1'
+    # avatarmanz's ordering for renderer port 1 (631400f, 15c3d0e: an indirect execution whose
+    # arguments or count the card reads in place is clamped alone, right before it runs, so
+    # that trees and lamp-lit rooms stop dropping out for a frame) is left off here: there are
+    # 1,440 such executions a frame in the opening, each then a dispatch of ours and a wait of
+    # its own, and the frame takes 40.0-41.4 ms with it against 31.7-32.4 without, by turns of
+    # ten seconds in one run (up-merge1, RX 7700 XT, -RayTracingLow, 2026-11-27).
+    # -More @{VICTORY_PORT_CONSTANTS_ORDER='1'}: the ordering, as upstream has it by default.
+    $settings.VICTORY_PORT_CONSTANTS_ORDER = '0'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
