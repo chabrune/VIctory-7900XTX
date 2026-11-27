@@ -313,6 +313,9 @@ struct Builder {
     off: usize,
     /// No stage runs before this frame.
     rests: u64,
+    /// Its programs' host pipelines were asked of the workers and are not
+    /// all made yet ([`builder_runs`]).
+    waiting: bool,
 }
 
 #[cfg(windows)]
@@ -321,7 +324,17 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     whole: false,
     off: 0,
     rests: 0,
+    waiting: false,
 });
+
+/// `VICTORY_BVH_BUILDER_NOW=1`: the structure builder's programs are made
+/// on the thread that records its first dispatch, one after the other, as
+/// before ([`builder_runs`] says what is done instead).
+#[cfg(windows)]
+fn builder_now() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER_NOW").is_some_and(|v| v == "1"))
+}
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
@@ -385,6 +398,26 @@ pub(crate) fn builder_runs() -> bool {
     }
     if b.whole {
         return true;
+    }
+    // The workers make them, and the builder rests until they have: made
+    // here one after the other, on the thread that records the title's list,
+    // they are tens of seconds of the driver's compiler when its cache has
+    // none of them (another executable's path, another translation), and the
+    // title ends itself when nothing was presented for 30 s
+    // (`VICTORY_BVH_BUILDER_NOW=1`: made here at once, as before).
+    if !builder_now() {
+        let making = b.pipelines.iter().filter(|p| make::asked(p).is_none()).count();
+        if making > 0 {
+            if !std::mem::replace(&mut b.waiting, true) {
+                tracing::info!(making, of = b.pipelines.len(), "the ray-tracing structure builder waits for its programs' host pipelines: no stage of it runs meanwhile");
+            }
+            return false;
+        }
+        if std::mem::take(&mut b.waiting) {
+            // (Stages of this frame were left out: all or none, from the next.)
+            b.rests = crate::frame::current() + 1;
+            return false;
+        }
     }
     let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     if !missing.is_empty() {
@@ -608,6 +641,28 @@ fn trace_turns() -> &'static [(String, u32)] {
 /// rested in the frame ([`rests`]).
 pub(crate) static RESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether [`rests`] waits for a pipeline's shaders to be translated by the
+/// worker that makes it before it asks whether they trace
+/// (`VICTORY_TRACE_ASK_LATE=0`: it translates them where it is asked, on the
+/// thread that records, as before).
+///
+/// With `VICTORY_TRACE_EVERY` every pipeline was translated at its first use
+/// on the thread that records the title's lists, to learn whether it is a
+/// trace program. With the translations in the cache that is nothing. With
+/// none there for the settings at hand (a new version of the translator, a
+/// switch that is part of the cache's key) each took 0.1 to 0.7 s, the first
+/// frame of the world asked it of some 340 shaders one after the other and
+/// was still being recorded 33 s later, and the title ends itself when
+/// nothing was presented for 30 s (run bel-merge2, 2026-11-27: frame 1953
+/// from 04:29:55 to the title's crash report at 04:30:28, "Unsignaled
+/// CrossQueueBarrier"; the report of 2026-11-26 19:18 has the same place and
+/// the same 38 s).
+#[cfg(windows)]
+fn trace_asked_late() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_ASK_LATE").is_none_or(|v| v != "0"))
+}
+
 /// Whether the pipeline `this` rests in this frame. One named in
 /// `VICTORY_PIPELINE_EVERY=<shader hash>:<n>[:<phase>],..` runs only in the
 /// frames whose number leaves `phase` (0 unless given) when divided by `n`
@@ -626,6 +681,14 @@ pub(crate) fn rests(this: This) -> bool {
         return false;
     }
     let p = pipeline(this);
+    // Whether it is a trace program is asked of its translation, and a
+    // shader is not translated here to answer: the pipeline runs (it has no
+    // host pipeline before its shaders are translated anyway) and is asked
+    // again once the worker that makes it has translated them.
+    #[cfg(windows)]
+    if p.every.get().is_none() && trace_every() > 1 && trace_asked_late() && p.shaders.iter().any(|s| s.translated.get().is_none()) {
+        return false;
+    }
     let (n, phase, trace) = *p.every.get_or_init(|| {
         if let Some(named) = p.shaders.iter().find_map(|s| list.iter().find(|e| e.0 == s.hash)) {
             return (named.1, named.2, false);

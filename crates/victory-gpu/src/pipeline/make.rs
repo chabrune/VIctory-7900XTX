@@ -415,6 +415,19 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Whether `p` has a host pipeline, if that is settled (made or refused);
+/// `None` while it is not: a worker is then asked for it, ahead of those no
+/// draw asked for, and nothing is waited for.
+pub(crate) fn asked(p: &Arc<Pending>) -> Option<bool> {
+    match p.made.get() {
+        Some(made) => Some(made.is_some()),
+        None => {
+            start(p, REQUESTED);
+            p.made.get().map(Option::is_some)
+        }
+    }
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
