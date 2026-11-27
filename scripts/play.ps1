@@ -253,8 +253,8 @@ $discarded = $inherited | Where-Object {
 if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
-$Exe = (Resolve-Path $Exe).Path
+$Exe = (Resolve-Path $Exe).Path; $claim = if ($Warm) { $null } else { & (Join-Path $PSScriptRoot 'run-lock.ps1') -Take $Exe -Console $Console -Holder $PID }; if (-not $Warm -and -not $claim) { exit 1 }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
     if ($Warm) { & $victory warm --used } else { & $victory run $Exe --execute --console $Console }
-} finally { Pop-Location }
+} finally { Pop-Location; if ($claim) { & (Join-Path $PSScriptRoot 'run-lock.ps1') -Release } }
