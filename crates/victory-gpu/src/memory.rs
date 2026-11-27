@@ -76,6 +76,8 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
+mod rt;
+
 /// Copies that can be numbered (the run of heap slots is one longer).
 const COPIES: u32 = (1 << 12) - 1;
 /// A directory page.
@@ -213,6 +215,8 @@ struct Memory {
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
     stats: Stats,
+    /// The card's own ray tracing behind the title's structures.
+    rt: rt::Rt,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
     #[cfg(feature = "diagnostics")]
@@ -260,7 +264,8 @@ pub(crate) struct Ready {
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
-        let bytes = u64::from(MEMORY_PAGES) * 8;
+        // (With the roots' table of the card's own ray tracing behind them.)
+        let bytes = u64::from(MEMORY_PAGES) * 8 + rt::table_bytes();
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
         // (As the arenas: refreshed whole by every list, written here alone.)
@@ -294,6 +299,7 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             stats: Stats::default(),
+            rt: rt::Rt::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
             #[cfg(feature = "diagnostics")]
@@ -464,6 +470,7 @@ impl Memory {
     /// given back.
     fn gone(&mut self, address: u64) {
         let Some(packed) = self.packed.remove(&address) else { return };
+        self.rt_gone(address);
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
@@ -1188,7 +1195,8 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            // (The views of the card's own structures follow the copies'.)
+            let base = heap.dynamic(COPIES + 1 + rt::slots())?;
             // Every slot of the run: a number shows no view of another kind.
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
@@ -1207,6 +1215,10 @@ pub(crate) fn ready(
     // may run after this one's (structures unpacked from zeros, and then
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
+    // What walks structures: the card's own are on their way.
+    if use_ == Use::Reads {
+        m.rt_ready(list, heap, base);
+    }
     let first_read = list.first_use(READ);
     if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
         m.bring_up(list);

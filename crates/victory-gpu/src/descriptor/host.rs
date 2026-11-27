@@ -3067,6 +3067,29 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` (a dynamic one) the view of the acceleration
+    /// structure in `structure` (the host's own ray tracing,
+    /// `crate::memory`), kept while the slot shows it.
+    pub(crate) fn structure_at(&self, index: u32, structure: &ID3D12Resource) {
+        let Some(host) = host() else { return };
+        // SAFETY: a live buffer.
+        let location = unsafe { structure.GetGPUVirtualAddress() };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV { Location: location },
+            },
+        };
+        // SAFETY: a slot of our heap; such a view names its structure by
+        // address and takes no resource.
+        unsafe { host.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), self.at(index)) };
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, Some(structure.clone()));
+    }
+
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// `len` bytes of `buffer` from byte `offset` (a multiple of 16): a
     /// root UAV with a size, whose accesses past it do nothing instead of
